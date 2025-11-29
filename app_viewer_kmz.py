@@ -5,6 +5,7 @@ import io
 import zipfile
 import random
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import pandas as pd
 import pydeck as pdk
@@ -16,12 +17,12 @@ st.set_page_config(page_title="Visor KMZ de Secciones", layout="wide")
 st.title("Visor web de KMZ — Secciones por Distrito")
 st.write(
     """
-Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secciones):
+Sube un archivo **KMZ o KML** o selecciona uno que ya tengas en el repositorio.
 
 - La app leerá el KML interno.
 - Detectará **carpetas por Distrito** (Folder) y **Placemarks** con polígonos.
 - Intentará respetar el **color de relleno** que venga en el KMZ (PolyStyle o styleUrl).
-- Pintará el **número de sección dentro de cada polígono** (si activas la opción).
+- Puede pintar el **número de sección dentro de cada polígono** (si activas la opción).
 """
 )
 
@@ -29,7 +30,6 @@ Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secci
 def parse_kml_color(color_text: str):
     """
     Convierte un color KML (aabbggrr en hex) a lista [r, g, b, a] (0-255).
-
     Ejemplo KML: '96ff0000' -> a=0x96, b=0xff, g=0x00, r=0x00 -> [0, 0, 255, 150]
     """
     if not color_text:
@@ -47,9 +47,9 @@ def parse_kml_color(color_text: str):
         return None
 
 
-def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
+def cargar_kmz_o_kml(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """
-    Lee un KMZ/KML y devuelve un DataFrame con:
+    Lee un KMZ/KML (bytes + nombre de archivo) y devuelve un DataFrame con:
     - district
     - section
     - polygon  (lista de [lon, lat])
@@ -57,11 +57,10 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
     - centroid_lat
     - color  (lista [r,g,b,a] si venía en el KML, sino None)
     """
-    # 1) Leer el texto KML
-    filename = uploaded_file.name.lower()
-    if filename.endswith(".kmz"):
-        zf = zipfile.ZipFile(uploaded_file)
-        # Tomamos el primer .kml dentro del KMZ
+    # 1) Obtener texto KML desde KMZ o KML plano
+    fname = filename.lower()
+    if fname.endswith(".kmz"):
+        zf = zipfile.ZipFile(io.BytesIO(file_bytes))
         kml_name = None
         for name in zf.namelist():
             if name.lower().endswith(".kml"):
@@ -73,7 +72,7 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
         kml_text = kml_bytes.decode("utf-8", errors="ignore")
     else:
         # Asumimos KML plano
-        kml_text = uploaded_file.read().decode("utf-8", errors="ignore")
+        kml_text = file_bytes.decode("utf-8", errors="ignore")
 
     # 2) Parsear XML
     ns = {"kml": "http://www.opengis.net/kml/2.2"}
@@ -91,9 +90,8 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
         rgba = parse_kml_color(color_elem.text)
         if rgba is None:
             continue
-        # Guardamos con y sin '#', porque styleUrl suele venir como '#id'
         style_colors[style_id] = rgba
-        style_colors["#" + style_id] = rgba
+        style_colors["#" + style_id] = rgba  # por si styleUrl viene con '#'
 
     registros = []
 
@@ -107,13 +105,13 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
             sec_elem = placemark.find("kml:name", ns)
             section_name = sec_elem.text.strip() if sec_elem is not None else ""
 
-            # 1) Intentar leer PolyStyle/color embebido en el Placemark
+            # 1) PolyStyle directo en el Placemark
             color_rgba = None
             color_elem = placemark.find(".//kml:PolyStyle/kml:color", ns)
             if color_elem is not None and color_elem.text:
                 color_rgba = parse_kml_color(color_elem.text)
 
-            # 2) Si no trae PolyStyle directo, ver si tiene styleUrl y buscar en styles globales
+            # 2) styleUrl que apunta a un Style global
             if color_rgba is None:
                 style_url_elem = placemark.find("kml:styleUrl", ns)
                 if style_url_elem is not None and style_url_elem.text:
@@ -163,7 +161,7 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Intentar sacar solo el número de sección
+    # Limpieza de texto de sección
     def limpia_sec(s):
         if s is None:
             return ""
@@ -173,7 +171,7 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
 
     df["section"] = df["section_raw"].apply(limpia_sec)
 
-    # Extra: campo numérico cuando se pueda
+    # Campo numérico cuando se pueda
     def to_int_or_none(s):
         try:
             return int(s)
@@ -185,14 +183,61 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
     return df
 
 
-uploaded_kmz = st.file_uploader(
-    "Sube tu archivo KMZ/KML con las secciones",
-    type=["kmz", "kml"]
+# ------------------ SELECCIÓN DE ARCHIVO ------------------ #
+
+st.sidebar.header("Fuente del archivo")
+
+modo_archivo = st.sidebar.radio(
+    "¿De dónde tomamos el KMZ/KML?",
+    ["Subir archivo", "Archivo del repositorio"],
+    index=0,
 )
 
-if uploaded_kmz is not None:
+file_bytes = None
+filename = None
+
+if modo_archivo == "Subir archivo":
+    uploaded_kmz = st.file_uploader(
+        "Sube tu archivo KMZ/KML con las secciones",
+        type=["kmz", "kml"]
+    )
+    if uploaded_kmz is not None:
+        file_bytes = uploaded_kmz.read()
+        filename = uploaded_kmz.name
+else:
+    # Buscar archivos en carpeta 'dir' dentro del repo
+    kmz_dir = Path("dir")
+    if not kmz_dir.exists():
+        st.sidebar.warning(
+            "Crea una carpeta llamada **'dir'** en la raíz del repositorio "
+            "y coloca ahí tus archivos .kmz/.kml."
+        )
+    else:
+        opciones = sorted(
+            [p.name for p in kmz_dir.glob("*.kmz")] +
+            [p.name for p in kmz_dir.glob("*.kml")]
+        )
+        if not opciones:
+            st.sidebar.warning(
+                "No se encontraron archivos .kmz/.kml en la carpeta 'dir'."
+            )
+        else:
+            archivo_sel = st.sidebar.selectbox(
+                "Archivo del repositorio",
+                opciones,
+                index=0,
+            )
+            if archivo_sel:
+                ruta = kmz_dir / archivo_sel
+                with ruta.open("rb") as f:
+                    file_bytes = f.read()
+                filename = archivo_sel
+
+# --------------------------------------------------------- #
+
+if file_bytes is not None and filename is not None:
     try:
-        df = cargar_kmz_o_kml(uploaded_kmz)
+        df = cargar_kmz_o_kml(file_bytes, filename)
     except Exception as e:
         st.error(f"No se pudo leer el KMZ/KML: {e}")
         st.stop()
@@ -203,7 +248,7 @@ if uploaded_kmz is not None:
 
     st.success(f"Se cargaron {len(df)} secciones de {df['district'].nunique()} distritos.")
 
-    # --- Panel lateral de filtros ---
+    # --- Panel de filtros (se reutiliza el sidebar) ---
     st.sidebar.header("Filtros")
 
     distritos = sorted(df["district"].unique())
@@ -215,7 +260,6 @@ if uploaded_kmz is not None:
 
     df_filtrado = df[df["district"].isin(dist_sel)]
 
-    # Filtrado por sección
     def sort_key(x):
         try:
             return (0, int(x))
@@ -230,7 +274,6 @@ if uploaded_kmz is not None:
         default=[]
     )
 
-    # 👉 Checkbox para mostrar u ocultar etiquetas
     show_labels = st.sidebar.checkbox(
         "Mostrar número de sección en el mapa",
         value=True
@@ -243,21 +286,19 @@ if uploaded_kmz is not None:
         st.warning("No hay secciones con esos filtros.")
         st.stop()
 
-    # --- Colores: usar los del KMZ si existen, si no, generarlos por distrito ---
     df_filtrado = df_filtrado.copy()
 
+    # Colores: usar los del KMZ si existen, si no, generarlos por distrito
     if df_filtrado["color"].isna().all():
-        # El KMZ no traía colores: generamos por distrito
         colores_por_distrito = {}
         for d in df_filtrado["district"].unique():
             random.seed(hash(d) & 0xFFFF)
             r = random.randint(80, 255)
             g = random.randint(80, 255)
             b = random.randint(80, 255)
-            colores_por_distrito[d] = [r, g, b, 140]  # RGBA
+            colores_por_distrito[d] = [r, g, b, 140]
         df_filtrado["color_vis"] = df_filtrado["district"].map(colores_por_distrito)
     else:
-        # Usamos el color que venga del KMZ; si alguno no tiene, le ponemos uno por distrito
         colores_por_distrito = {}
         for d in df_filtrado["district"].unique():
             random.seed(hash(d) & 0xFFFF)
@@ -273,7 +314,7 @@ if uploaded_kmz is not None:
 
         df_filtrado["color_vis"] = df_filtrado.apply(pick_color, axis=1)
 
-    # --- Vista inicial del mapa ---
+    # Vista inicial
     view_state = pdk.ViewState(
         longitude=float(df_filtrado["centroid_lon"].mean()),
         latitude=float(df_filtrado["centroid_lat"].mean()),
@@ -281,7 +322,7 @@ if uploaded_kmz is not None:
         pitch=0,
     )
 
-    # --- Capa de polígonos ---
+    # Capa de polígonos
     polygon_layer = pdk.Layer(
         "PolygonLayer",
         df_filtrado,
@@ -295,7 +336,7 @@ if uploaded_kmz is not None:
 
     layers = [polygon_layer]
 
-    # --- Capa de texto con el número de sección (opcional) ---
+    # Capa de texto opcional
     if show_labels:
         text_layer = pdk.Layer(
             "TextLayer",
@@ -321,9 +362,8 @@ if uploaded_kmz is not None:
         map_style="light"
     )
 
-    # --- Mapa a todo el ancho ---
     st.subheader("Mapa interactivo")
     st.pydeck_chart(deck, use_container_width=True)
 
 else:
-    st.info("Sube un KMZ/KML para comenzar.")
+    st.info("Selecciona un archivo del repo o súbelo para comenzar.")
