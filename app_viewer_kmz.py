@@ -20,7 +20,7 @@ Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secci
 
 - La app leerá el KML interno.
 - Detectará **carpetas por Distrito** (Folder) y **Placemarks** con polígonos.
-- Respetará el **color de relleno** que venga en el KMZ.
+- Intentará respetar el **color de relleno** que venga en el KMZ (PolyStyle o styleUrl).
 - Pintará el **número de sección dentro de cada polígono**.
 """
 )
@@ -79,6 +79,22 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
     ns = {"kml": "http://www.opengis.net/kml/2.2"}
     root = ET.fromstring(kml_text)
 
+    # --- Mapa de estilos globales (Style id -> color) ---
+    style_colors = {}
+    for style in root.findall(".//kml:Style", ns):
+        style_id = style.attrib.get("id")
+        if not style_id:
+            continue
+        color_elem = style.find(".//kml:PolyStyle/kml:color", ns)
+        if color_elem is None or not color_elem.text:
+            continue
+        rgba = parse_kml_color(color_elem.text)
+        if rgba is None:
+            continue
+        # Guardamos con y sin '#', porque styleUrl suele venir como '#id'
+        style_colors[style_id] = rgba
+        style_colors["#" + style_id] = rgba
+
     registros = []
 
     # Buscamos Folders (cada uno suele ser un Distrito)
@@ -91,11 +107,19 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
             sec_elem = placemark.find("kml:name", ns)
             section_name = sec_elem.text.strip() if sec_elem is not None else ""
 
-            # Intentamos leer el color desde PolyStyle dentro del Placemark
+            # 1) Intentar leer PolyStyle/color embebido en el Placemark
             color_rgba = None
             color_elem = placemark.find(".//kml:PolyStyle/kml:color", ns)
             if color_elem is not None and color_elem.text:
                 color_rgba = parse_kml_color(color_elem.text)
+
+            # 2) Si no trae PolyStyle directo, ver si tiene styleUrl y buscar en styles globales
+            if color_rgba is None:
+                style_url_elem = placemark.find("kml:styleUrl", ns)
+                if style_url_elem is not None and style_url_elem.text:
+                    style_ref = style_url_elem.text.strip()
+                    if style_ref in style_colors:
+                        color_rgba = style_colors[style_ref]
 
             poly = placemark.find(".//kml:Polygon", ns)
             if poly is None:
@@ -287,20 +311,9 @@ if uploaded_kmz is not None:
         map_style="light"
     )
 
-    # --- Layout en dos columnas: mapa + tabla ---
-    col_map, col_table = st.columns([2.5, 1.5])
-
-    with col_map:
-        st.subheader("Mapa interactivo")
-        st.pydeck_chart(deck)
-
-    with col_table:
-        st.subheader("Secciones cargadas")
-        st.dataframe(
-            df_filtrado[["district", "section"]]
-            .sort_values(by=["district", "section"])
-            .reset_index(drop=True)
-        )
+    # --- Mapa a todo el ancho ---
+    st.subheader("Mapa interactivo")
+    st.pydeck_chart(deck, use_container_width=True)
 
 else:
     st.info("Sube un KMZ/KML para comenzar.")
