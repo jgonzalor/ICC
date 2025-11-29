@@ -1,0 +1,13 @@
+streamlit==1.35.0
+
+# Lectura de shapefiles
+pyshp==2.3.1
+
+# Generar KML/KMZ
+simplekml==1.3.6
+
+# Convertir coordenadas desde el PRJ del INE a WGS84
+pyproj==3.6.1
+
+# (Opcional pero muy útil para cuando metamos CSV del IEES con LN/casillas)
+pandas==2.2.2
