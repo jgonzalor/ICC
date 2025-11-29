@@ -187,10 +187,22 @@ def cargar_kmz_o_kml(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
 st.sidebar.header("Fuente del archivo")
 
+# Revisamos si ya hay archivos en 'dir' para decidir el modo por defecto
+repo_dir = Path("dir")
+repo_files = []
+if repo_dir.exists():
+    repo_files = sorted(
+        [p.name for p in repo_dir.glob("*.kmz")] +
+        [p.name for p in repo_dir.glob("*.kml")]
+    )
+
+# Si hay archivos en 'dir', arrancamos en "Archivo del repositorio"
+default_radio_index = 1 if repo_files else 0
+
 modo_archivo = st.sidebar.radio(
     "¿De dónde tomamos el KMZ/KML?",
     ["Subir archivo", "Archivo del repositorio"],
-    index=0,
+    index=default_radio_index,
 )
 
 file_bytes = None
@@ -205,30 +217,25 @@ if modo_archivo == "Subir archivo":
         file_bytes = uploaded_kmz.read()
         filename = uploaded_kmz.name
 else:
-    # Buscar archivos en carpeta 'dir' dentro del repo
-    kmz_dir = Path("dir")
-    if not kmz_dir.exists():
+    # Usar carpeta 'dir' dentro del repo
+    if not repo_dir.exists():
         st.sidebar.warning(
             "Crea una carpeta llamada **'dir'** en la raíz del repositorio "
             "y coloca ahí tus archivos .kmz/.kml."
         )
     else:
-        opciones = sorted(
-            [p.name for p in kmz_dir.glob("*.kmz")] +
-            [p.name for p in kmz_dir.glob("*.kml")]
-        )
-        if not opciones:
+        if not repo_files:
             st.sidebar.warning(
                 "No se encontraron archivos .kmz/.kml en la carpeta 'dir'."
             )
         else:
             archivo_sel = st.sidebar.selectbox(
                 "Archivo del repositorio",
-                opciones,
+                repo_files,
                 index=0,
             )
             if archivo_sel:
-                ruta = kmz_dir / archivo_sel
+                ruta = repo_dir / archivo_sel
                 with ruta.open("rb") as f:
                     file_bytes = f.read()
                 filename = archivo_sel
