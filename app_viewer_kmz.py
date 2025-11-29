@@ -255,28 +255,23 @@ if file_bytes is not None and filename is not None:
 
     st.success(f"Se cargaron {len(df)} secciones de {df['district'].nunique()} distritos.")
 
-    # --- FILTROS EN CASCADA (Distrito -> Sección) ---
+    # --- FILTROS: distritos tipo "check" (multiselect) + secciones del subconjunto ---
+
     st.sidebar.header("Filtros")
 
     distritos = sorted(df["district"].unique())
-    # Opción "Todos" solo si hay más de un distrito
-    if len(distritos) > 1:
-        opciones_dist = ["Todos"] + distritos
-        default_dist_index = 0  # "Todos"
-    else:
-        opciones_dist = distritos
-        default_dist_index = 0
 
-    dist_sel = st.sidebar.selectbox(
-        "Distrito",
-        options=opciones_dist,
-        index=default_dist_index
+    dist_sel = st.sidebar.multiselect(
+        "Distritos",
+        options=distritos,
+        default=distritos  # todos marcados al inicio
     )
 
-    if dist_sel == "Todos":
+    # Si no seleccionó nada, usamos todos para no dejar vacío
+    if not dist_sel:
         df_base = df
     else:
-        df_base = df[df["district"] == dist_sel]
+        df_base = df[df["district"].isin(dist_sel)]
 
     def sort_key(x):
         try:
@@ -287,7 +282,7 @@ if file_bytes is not None and filename is not None:
     secciones_vals = sorted(df_base["section"].unique().tolist(), key=sort_key)
 
     sec_sel = st.sidebar.multiselect(
-        "Sección (opcional)",
+        "Secciones (opcional)",
         options=secciones_vals,
         default=[]
     )
