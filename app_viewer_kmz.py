@@ -20,9 +20,31 @@ Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secci
 
 - La app leerá el KML interno.
 - Detectará **carpetas por Distrito** (Folder) y **Placemarks** con polígonos.
-- Podrás **filtrar** por distrito y sección y ver el mapa directamente en la web.
+- Respetará el **color de relleno** que venga en el KMZ.
+- Pintará el **número de sección dentro de cada polígono**.
 """
 )
+
+
+def parse_kml_color(color_text: str):
+    """
+    Convierte un color KML (aabbggrr en hex) a lista [r, g, b, a] (0-255).
+
+    Ejemplo KML: '96ff0000' -> a=0x96, b=0xff, g=0x00, r=0x00 -> [0, 0, 255, 150]
+    """
+    if not color_text:
+        return None
+    txt = color_text.strip().lstrip("#")
+    if len(txt) != 8:
+        return None
+    try:
+        aa = int(txt[0:2], 16)
+        bb = int(txt[2:4], 16)
+        gg = int(txt[4:6], 16)
+        rr = int(txt[6:8], 16)
+        return [rr, gg, bb, aa]
+    except Exception:
+        return None
 
 
 def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
@@ -33,6 +55,7 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
     - polygon  (lista de [lon, lat])
     - centroid_lon
     - centroid_lat
+    - color  (lista [r,g,b,a] si venía en el KML, sino None)
     """
     # 1) Leer el texto KML
     filename = uploaded_file.name.lower()
@@ -68,6 +91,12 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
             sec_elem = placemark.find("kml:name", ns)
             section_name = sec_elem.text.strip() if sec_elem is not None else ""
 
+            # Intentamos leer el color desde PolyStyle dentro del Placemark
+            color_rgba = None
+            color_elem = placemark.find(".//kml:PolyStyle/kml:color", ns)
+            if color_elem is not None and color_elem.text:
+                color_rgba = parse_kml_color(color_elem.text)
+
             poly = placemark.find(".//kml:Polygon", ns)
             if poly is None:
                 continue
@@ -102,6 +131,7 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
                     "polygon": coord_pairs,
                     "centroid_lon": centroid_lon,
                     "centroid_lat": centroid_lat,
+                    "color": color_rgba,
                 }
             )
 
@@ -115,7 +145,6 @@ def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
             return ""
         txt = str(s).strip()
         txt = txt.replace("SEC", "").replace("Sec", "").strip()
-        # Ej: "0287", "287", "287A"
         return txt
 
     df["section"] = df["section_raw"].apply(limpia_sec)
@@ -163,15 +192,13 @@ if uploaded_kmz is not None:
     df_filtrado = df[df["district"].isin(dist_sel)]
 
     # Filtrado por sección
-    # Ordenamos: primero numéricas, luego texto
-    secciones_vals = df_filtrado["section"].unique().tolist()
-    # Orden inteligente
     def sort_key(x):
         try:
             return (0, int(x))
         except Exception:
             return (1, x)
-    secciones_vals = sorted(secciones_vals, key=sort_key)
+
+    secciones_vals = sorted(df_filtrado["section"].unique().tolist(), key=sort_key)
 
     sec_sel = st.sidebar.multiselect(
         "Sección (opcional)",
@@ -186,18 +213,35 @@ if uploaded_kmz is not None:
         st.warning("No hay secciones con esos filtros.")
         st.stop()
 
-    # --- Asignar colores por distrito ---
-    colores_por_distrito = {}
-    for d in df_filtrado["district"].unique():
-        # color estable por distrito (usando hash como semilla)
-        random.seed(hash(d) & 0xFFFF)
-        r = random.randint(80, 255)
-        g = random.randint(80, 255)
-        b = random.randint(80, 255)
-        colores_por_distrito[d] = [r, g, b, 140]  # RGBA
-
+    # --- Colores: usar los del KMZ si existen, si no, generarlos por distrito ---
     df_filtrado = df_filtrado.copy()
-    df_filtrado["color"] = df_filtrado["district"].map(colores_por_distrito)
+
+    if df_filtrado["color"].isna().all():
+        # El KMZ no traía colores: generamos por distrito
+        colores_por_distrito = {}
+        for d in df_filtrado["district"].unique():
+            random.seed(hash(d) & 0xFFFF)
+            r = random.randint(80, 255)
+            g = random.randint(80, 255)
+            b = random.randint(80, 255)
+            colores_por_distrito[d] = [r, g, b, 140]  # RGBA
+        df_filtrado["color_vis"] = df_filtrado["district"].map(colores_por_distrito)
+    else:
+        # Usamos el color que venga del KMZ; si alguno no tiene, le ponemos uno por distrito
+        colores_por_distrito = {}
+        for d in df_filtrado["district"].unique():
+            random.seed(hash(d) & 0xFFFF)
+            r = random.randint(80, 255)
+            g = random.randint(80, 255)
+            b = random.randint(80, 255)
+            colores_por_distrito[d] = [r, g, b, 140]
+
+        def pick_color(row):
+            if isinstance(row["color"], list):
+                return row["color"]
+            return colores_por_distrito[row["district"]]
+
+        df_filtrado["color_vis"] = df_filtrado.apply(pick_color, axis=1)
 
     # --- Vista inicial del mapa ---
     view_state = pdk.ViewState(
@@ -212,11 +256,22 @@ if uploaded_kmz is not None:
         "PolygonLayer",
         df_filtrado,
         get_polygon="polygon",
-        get_fill_color="color",
+        get_fill_color="color_vis",
         get_line_color=[80, 80, 80],
         get_line_width=30,
         pickable=True,
         auto_highlight=True,
+    )
+
+    # --- Capa de texto con el número de sección ---
+    text_layer = pdk.Layer(
+        "TextLayer",
+        df_filtrado,
+        get_position="[centroid_lon, centroid_lat]",
+        get_text="section",
+        get_size=12,
+        get_color=[0, 0, 0, 255],
+        get_alignment_baseline="'center'",
     )
 
     tooltip = {
@@ -226,7 +281,7 @@ if uploaded_kmz is not None:
     }
 
     deck = pdk.Deck(
-        layers=[polygon_layer],
+        layers=[polygon_layer, text_layer],
         initial_view_state=view_state,
         tooltip=tooltip,
         map_style="light"
