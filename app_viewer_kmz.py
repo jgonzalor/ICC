@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import io
+import zipfile
+import random
+import xml.etree.ElementTree as ET
+
+import pandas as pd
+import pydeck as pdk
+import streamlit as st
+
+
+st.set_page_config(page_title="Visor KMZ de Secciones", layout="wide")
+
+st.title("Visor web de KMZ — Secciones por Distrito")
+st.write(
+    """
+Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secciones):
+
+- La app leerá el KML interno.
+- Detectará **carpetas por Distrito** (Folder) y **Placemarks** con polígonos.
+- Podrás **filtrar** por distrito y sección y ver el mapa directamente en la web.
+"""
+)
+
+
+def cargar_kmz_o_kml(uploaded_file: io.BytesIO) -> pd.DataFrame:
+    """
+    Lee un KMZ/KML y devuelve un DataFrame con:
+    - district
+    - section
+    - polygon  (lista de [lon, lat])
+    - centroid_lon
+    - centroid_lat
+    """
+    # 1) Leer el texto KML
+    filename = uploaded_file.name.lower()
+    if filename.endswith(".kmz"):
+        zf = zipfile.ZipFile(uploaded_file)
+        # Tomamos el primer .kml dentro del KMZ
+        kml_name = None
+        for name in zf.namelist():
+            if name.lower().endswith(".kml"):
+                kml_name = name
+                break
+        if kml_name is None:
+            raise ValueError("El KMZ no contiene ningún archivo .kml.")
+        kml_bytes = zf.read(kml_name)
+        kml_text = kml_bytes.decode("utf-8", errors="ignore")
+    else:
+        # Asumimos KML plano
+        kml_text = uploaded_file.read().decode("utf-8", errors="ignore")
+
+    # 2) Parsear XML
+    ns = {"kml": "http://www.opengis.net/kml/2.2"}
+    root = ET.fromstring(kml_text)
+
+    registros = []
+
+    # Buscamos Folders (cada uno suele ser un Distrito)
+    for folder in root.findall(".//kml:Folder", ns):
+        name_elem = folder.find("kml:name", ns)
+        district_name = name_elem.text.strip() if name_elem is not None else "Sin distrito"
+
+        # Dentro del folder, buscamos Placemarks con Polygon
+        for placemark in folder.findall("kml:Placemark", ns):
+            sec_elem = placemark.find("kml:name", ns)
+            section_name = sec_elem.text.strip() if sec_elem is not None else ""
+
+            poly = placemark.find(".//kml:Polygon", ns)
+            if poly is None:
+                continue
+            coords_elem = poly.find(".//kml:coordinates", ns)
+            if coords_elem is None or not coords_elem.text:
+                continue
+
+            coord_pairs = []
+            for token in coords_elem.text.replace("\n", " ").split():
+                parts = token.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                    coord_pairs.append([lon, lat])
+                except ValueError:
+                    continue
+
+            if not coord_pairs:
+                continue
+
+            lons = [p[0] for p in coord_pairs]
+            lats = [p[1] for p in coord_pairs]
+            centroid_lon = sum(lons) / len(lons)
+            centroid_lat = sum(lats) / len(lats)
+
+            registros.append(
+                {
+                    "district": district_name,
+                    "section_raw": section_name,
+                    "polygon": coord_pairs,
+                    "centroid_lon": centroid_lon,
+                    "centroid_lat": centroid_lat,
+                }
+            )
+
+    df = pd.DataFrame(registros)
+    if df.empty:
+        return df
+
+    # Intentar sacar solo el número de sección
+    def limpia_sec(s):
+        if s is None:
+            return ""
+        txt = str(s).strip()
+        txt = txt.replace("SEC", "").replace("Sec", "").strip()
+        # Ej: "0287", "287", "287A"
+        return txt
+
+    df["section"] = df["section_raw"].apply(limpia_sec)
+
+    # Extra: campo numérico cuando se pueda
+    def to_int_or_none(s):
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    df["section_int"] = df["section"].apply(to_int_or_none)
+
+    return df
+
+
+uploaded_kmz = st.file_uploader(
+    "Sube tu archivo KMZ/KML con las secciones",
+    type=["kmz", "kml"]
+)
+
+if uploaded_kmz is not None:
+    try:
+        df = cargar_kmz_o_kml(uploaded_kmz)
+    except Exception as e:
+        st.error(f"No se pudo leer el KMZ/KML: {e}")
+        st.stop()
+
+    if df.empty:
+        st.warning("No se encontraron polígonos en el archivo.")
+        st.stop()
+
+    st.success(f"Se cargaron {len(df)} secciones de {df['district'].nunique()} distritos.")
+
+    # --- Panel lateral de filtros ---
+    st.sidebar.header("Filtros")
+
+    distritos = sorted(df["district"].unique())
+    dist_sel = st.sidebar.multiselect(
+        "Distrito",
+        options=distritos,
+        default=distritos
+    )
+
+    df_filtrado = df[df["district"].isin(dist_sel)]
+
+    # Filtrado por sección
+    # Ordenamos: primero numéricas, luego texto
+    secciones_vals = df_filtrado["section"].unique().tolist()
+    # Orden inteligente
+    def sort_key(x):
+        try:
+            return (0, int(x))
+        except Exception:
+            return (1, x)
+    secciones_vals = sorted(secciones_vals, key=sort_key)
+
+    sec_sel = st.sidebar.multiselect(
+        "Sección (opcional)",
+        options=secciones_vals,
+        default=[]
+    )
+
+    if sec_sel:
+        df_filtrado = df_filtrado[df_filtrado["section"].isin(sec_sel)]
+
+    if df_filtrado.empty:
+        st.warning("No hay secciones con esos filtros.")
+        st.stop()
+
+    # --- Asignar colores por distrito ---
+    colores_por_distrito = {}
+    for d in df_filtrado["district"].unique():
+        # color estable por distrito (usando hash como semilla)
+        random.seed(hash(d) & 0xFFFF)
+        r = random.randint(80, 255)
+        g = random.randint(80, 255)
+        b = random.randint(80, 255)
+        colores_por_distrito[d] = [r, g, b, 140]  # RGBA
+
+    df_filtrado = df_filtrado.copy()
+    df_filtrado["color"] = df_filtrado["district"].map(colores_por_distrito)
+
+    # --- Vista inicial del mapa ---
+    view_state = pdk.ViewState(
+        longitude=float(df_filtrado["centroid_lon"].mean()),
+        latitude=float(df_filtrado["centroid_lat"].mean()),
+        zoom=11,
+        pitch=0,
+    )
+
+    # --- Capa de polígonos ---
+    polygon_layer = pdk.Layer(
+        "PolygonLayer",
+        df_filtrado,
+        get_polygon="polygon",
+        get_fill_color="color",
+        get_line_color=[80, 80, 80],
+        get_line_width=30,
+        pickable=True,
+        auto_highlight=True,
+    )
+
+    tooltip = {
+        "html": "<b>Distrito:</b> {district}<br/>"
+                "<b>Sección:</b> {section}",
+        "style": {"backgroundColor": "white", "color": "black"}
+    }
+
+    deck = pdk.Deck(
+        layers=[polygon_layer],
+        initial_view_state=view_state,
+        tooltip=tooltip,
+        map_style="light"
+    )
+
+    # --- Layout en dos columnas: mapa + tabla ---
+    col_map, col_table = st.columns([2.5, 1.5])
+
+    with col_map:
+        st.subheader("Mapa interactivo")
+        st.pydeck_chart(deck)
+
+    with col_table:
+        st.subheader("Secciones cargadas")
+        st.dataframe(
+            df_filtrado[["district", "section"]]
+            .sort_values(by=["district", "section"])
+            .reset_index(drop=True)
+        )
+
+else:
+    st.info("Sube un KMZ/KML para comenzar.")
