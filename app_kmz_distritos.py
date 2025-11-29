@@ -286,4 +286,3 @@ if uploaded_zip is not None:
                 5. El número de la sección aparece rotulado sobre cada polígono.
                 """
             )
-app_kmz_distritos.py
