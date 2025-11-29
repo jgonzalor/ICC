@@ -21,7 +21,7 @@ Sube un archivo **KMZ o KML** (por ejemplo, el que generaste con la app de secci
 - La app leerá el KML interno.
 - Detectará **carpetas por Distrito** (Folder) y **Placemarks** con polígonos.
 - Intentará respetar el **color de relleno** que venga en el KMZ (PolyStyle o styleUrl).
-- Pintará el **número de sección dentro de cada polígono**.
+- Pintará el **número de sección dentro de cada polígono** (si activas la opción).
 """
 )
 
@@ -230,6 +230,12 @@ if uploaded_kmz is not None:
         default=[]
     )
 
+    # 👉 Checkbox para mostrar u ocultar etiquetas
+    show_labels = st.sidebar.checkbox(
+        "Mostrar número de sección en el mapa",
+        value=True
+    )
+
     if sec_sel:
         df_filtrado = df_filtrado[df_filtrado["section"].isin(sec_sel)]
 
@@ -287,16 +293,20 @@ if uploaded_kmz is not None:
         auto_highlight=True,
     )
 
-    # --- Capa de texto con el número de sección ---
-    text_layer = pdk.Layer(
-        "TextLayer",
-        df_filtrado,
-        get_position="[centroid_lon, centroid_lat]",
-        get_text="section",
-        get_size=12,
-        get_color=[0, 0, 0, 255],
-        get_alignment_baseline="'center'",
-    )
+    layers = [polygon_layer]
+
+    # --- Capa de texto con el número de sección (opcional) ---
+    if show_labels:
+        text_layer = pdk.Layer(
+            "TextLayer",
+            df_filtrado,
+            get_position="[centroid_lon, centroid_lat]",
+            get_text="section",
+            get_size=12,
+            get_color=[0, 0, 0, 255],
+            get_alignment_baseline="'center'",
+        )
+        layers.append(text_layer)
 
     tooltip = {
         "html": "<b>Distrito:</b> {district}<br/>"
@@ -305,7 +315,7 @@ if uploaded_kmz is not None:
     }
 
     deck = pdk.Deck(
-        layers=[polygon_layer, text_layer],
+        layers=layers,
         initial_view_state=view_state,
         tooltip=tooltip,
         map_style="light"
