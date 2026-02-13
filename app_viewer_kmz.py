@@ -1,26 +1,28 @@
 # icc/app_viewer_kmz.py
 # ICC — Manzanas (cuadras) por Sección Electoral (INE x INEGI)
-# - Carga ZIP INE (BGD) y ZIP INEGI (Marco Geoestadístico)
-# - Detecta TODOS los .shp (incluye ZIPs anidados) y te deja elegir capas
-# - Conteo de manzanas por sección (spatial join)
-# - Mapa con relieve/topo/calles + tabla + export
+# - ZIP INE (BGD) + ZIP INEGI (Marco)
+# - Detecta SHP, permite elegir capas
+# - Robustez: sidecars, geometría activa, CRS
+# - Conteo manzanas por sección + mapa relieve/topo/calles
 
 from __future__ import annotations
 
 import io
 import os
+import re
 import zipfile
 import tempfile
 import hashlib
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import pandas as pd
 import streamlit as st
 
 try:
     import geopandas as gpd
-except ModuleNotFoundError:
-    st.error("Falta instalar 'geopandas'. Revisa tu requirements.txt.")
+    from geopandas.array import GeometryDtype
+except Exception:
+    st.error("Falta geopandas/shapely en tu entorno. Revisa requirements.txt.")
     st.stop()
 
 import folium
@@ -31,102 +33,61 @@ from streamlit_folium import st_folium
 # UI
 # =========================
 st.set_page_config(page_title="ICC — Manzanas por Sección", page_icon="🗺️", layout="wide")
-
 st.title("🗺️ ICC — Manzanas (cuadras) por Sección Electoral")
-st.caption(
-    "Sube los ZIP de INE (Secciones) e INEGI (Manzanas). "
-    "Esta versión detecta múltiples SHP (y ZIPs anidados) y te deja elegir el correcto."
-)
+st.caption("Sube ZIP INE (Secciones) e INEGI (Manzanas). Luego contamos cuántas manzanas caen dentro de cada sección.")
 
 
 # =========================
-# ZIP helpers (robustos)
+# ZIP helpers
 # =========================
 def _md5(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-def _safe_extract_zip(zip_path: str, out_dir: str) -> None:
-    """Extrae zip_path a out_dir (no revienta si hay archivos raros)."""
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(out_dir)
-    except Exception:
-        # Si el zip trae un archivo corrupto/extraño, igual seguimos con lo demás
-        try:
-            with zipfile.ZipFile(zip_path, "r") as z:
-                for name in z.namelist():
-                    try:
-                        z.extract(name, out_dir)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-
-def _extract_zip_bytes_to_dir(zip_bytes: bytes, out_dir: str) -> str:
-    """Guarda bytes como root.zip y lo extrae."""
-    root_zip = os.path.join(out_dir, "root.zip")
-    with open(root_zip, "wb") as f:
+def _safe_extract_zip_bytes(zip_bytes: bytes, out_dir: str) -> None:
+    """Extrae zip_bytes en out_dir."""
+    zpath = os.path.join(out_dir, "root.zip")
+    with open(zpath, "wb") as f:
         f.write(zip_bytes)
-    _safe_extract_zip(root_zip, out_dir)
-    return out_dir
+    with zipfile.ZipFile(zpath, "r") as z:
+        z.extractall(out_dir)
 
 
 def _extract_nested_zips(base_dir: str, max_depth: int = 2) -> None:
-    """
-    Busca ZIPs dentro del directorio y los extrae a subcarpetas.
-    max_depth=2 suele ser suficiente para INE/INEGI.
-    """
-    for depth in range(max_depth):
+    """Extrae ZIPs anidados (hasta max_depth)."""
+    for _ in range(max_depth):
         nested = []
         for root, _, files in os.walk(base_dir):
             for fn in files:
                 if fn.lower().endswith(".zip") and fn.lower() != "root.zip":
                     nested.append(os.path.join(root, fn))
-
         if not nested:
             return
-
-        for zpath in nested:
-            sub = zpath + "_unzipped"
-            if not os.path.exists(sub):
-                os.makedirs(sub, exist_ok=True)
-                _safe_extract_zip(zpath, sub)
-
-
-def _list_files(base_dir: str, limit: int = 300) -> List[str]:
-    out = []
-    for root, _, files in os.walk(base_dir):
-        for fn in files:
-            rel = os.path.relpath(os.path.join(root, fn), base_dir)
-            out.append(rel)
-            if len(out) >= limit:
-                return out
-    return out
+        for z in nested:
+            out = z + "_unzipped"
+            if not os.path.exists(out):
+                os.makedirs(out, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(z, "r") as zz:
+                        zz.extractall(out)
+                except Exception:
+                    pass
 
 
 def prepare_zip_workspace(zip_bytes: bytes, key: str) -> Tuple[str, List[str]]:
-    """
-    Extrae ZIP (y ZIPs anidados) a un workspace persistente en session_state.
-    Regresa: (workspace_dir, lista_relativa_de_shp)
-    """
+    """Extrae ZIP (y zip anidados) a workspace cacheado; regresa (dir, lista shp rel)."""
     h = _md5(zip_bytes)
-    ss_key = f"_zip_ws_{key}"
+    ss_key = f"_ws_{key}"
 
-    # Reusar si ya está el mismo archivo
     if ss_key in st.session_state:
-        if st.session_state[ss_key].get("hash") == h and os.path.exists(st.session_state[ss_key].get("dir", "")):
-            ws = st.session_state[ss_key]["dir"]
-            shps = st.session_state[ss_key]["shps"]
-            return ws, shps
+        item = st.session_state[ss_key]
+        if item.get("hash") == h and os.path.exists(item.get("dir", "")):
+            return item["dir"], item["shps"]
 
-    # Si cambia archivo: crear workspace nuevo
     ws = tempfile.mkdtemp(prefix=f"{key}_")
-    _extract_zip_bytes_to_dir(zip_bytes, ws)
+    _safe_extract_zip_bytes(zip_bytes, ws)
     _extract_nested_zips(ws, max_depth=2)
 
-    # listar shp
     shps = []
     for root, _, files in os.walk(ws):
         for fn in files:
@@ -138,22 +99,132 @@ def prepare_zip_workspace(zip_bytes: bytes, key: str) -> Tuple[str, List[str]]:
     return ws, shps
 
 
-def read_gdf(ws_dir: str, shp_rel: str) -> gpd.GeoDataFrame:
+def _auto_pick_shp(shps: List[str], kind: str) -> int:
+    """
+    Autoselección:
+    - INE secciones: contiene 'SECCION'/'SECC'
+    - INEGI manzanas: patrón /25m.shp (o /..m.shp) o contiene 'MANZ'
+    """
+    low = [s.lower() for s in shps]
+    if kind == "ine_seccion":
+        for i, s in enumerate(low):
+            if "seccion" in s or "secc" in s:
+                return i
+        return 0
+
+    if kind == "inegi_manzana":
+        # típico: 25m.shp para Sinaloa
+        for i, s in enumerate(low):
+            if re.search(r"(^|/)\d{2}m\.shp$", s):
+                return i
+        # alternativa: contiene manz/manzana/mza
+        for i, s in enumerate(low):
+            if "manz" in s or "manzana" in s or "mza" in s:
+                return i
+        return 0
+
+    return 0
+
+
+def _sidecar_missing(shp_path: str) -> List[str]:
+    """Verifica sidecars básicos del shapefile."""
+    base = os.path.splitext(shp_path)[0]
+    needed = [base + ".dbf", base + ".shx", base + ".prj"]
+    miss = [os.path.basename(p) for p in needed if not os.path.exists(p)]
+    return miss
+
+
+def _ensure_geometry_active(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Asegura que el GeoDataFrame tenga geometría activa.
+    Si no, intenta encontrar una columna geométrica y setearla.
+    """
+    # Caso normal
+    try:
+        _ = gdf.geometry  # noqa
+        return gdf
+    except Exception:
+        pass
+
+    # Intento 1: columna llamada GEOMETRY
+    for cand in ["GEOMETRY", "geometry", "Shape", "SHAPE", "geom", "GEOM"]:
+        if cand in gdf.columns:
+            try:
+                return gdf.set_geometry(cand)
+            except Exception:
+                pass
+
+    # Intento 2: primera columna de tipo geometry (si la detecta)
+    for c in gdf.columns:
+        try:
+            if isinstance(gdf[c].dtype, GeometryDtype):
+                return gdf.set_geometry(c)
+        except Exception:
+            pass
+
+    # Intento 3: inspección por valores shapely (geom_type)
+    for c in gdf.columns:
+        s = gdf[c].dropna()
+        if len(s) == 0:
+            continue
+        v = s.iloc[0]
+        if hasattr(v, "geom_type"):
+            try:
+                return gdf.set_geometry(c)
+            except Exception:
+                pass
+
+    return gdf  # no se pudo
+
+
+def read_gdf(ws_dir: str, shp_rel: str, label: str) -> gpd.GeoDataFrame:
     shp_path = os.path.join(ws_dir, shp_rel)
     if not os.path.exists(shp_path):
         raise FileNotFoundError(f"No existe el SHP seleccionado: {shp_rel}")
 
+    miss = _sidecar_missing(shp_path)
+    if miss:
+        st.warning(
+            f"⚠️ La capa **{os.path.basename(shp_rel)}** parece incompleta (faltan: {', '.join(miss)}). "
+            "Esto puede causar que se lea sin geometría."
+        )
+
     gdf = gpd.read_file(shp_path)
-    gdf = gdf[gdf.geometry.notna()].copy()
+    # normalizar columnas
     gdf.columns = [str(c).strip().upper() for c in gdf.columns]
 
-    # CRS -> EPSG:4326 para mapa
-    if gdf.crs is None:
-        st.warning("⚠️ La capa no trae CRS. Asumiendo EPSG:4326 para visualización.")
-        gdf = gdf.set_crs(epsg=4326, allow_override=True)
-    gdf = gdf.to_crs(epsg=4326)
+    # asegurar geometría activa antes de tocar CRS
+    gdf = _ensure_geometry_active(gdf)
 
-    # intentar arreglar geometrías inválidas
+    # debug si sigue sin geometría
+    try:
+        _ = gdf.geometry
+        has_geom = True
+    except Exception:
+        has_geom = False
+
+    if not has_geom:
+        with st.expander(f"🧪 Debug: {label} se leyó SIN geometría (revisa capa/ZIP)", expanded=True):
+            st.write("Archivo:", shp_rel)
+            st.write("Columnas:", list(gdf.columns))
+            st.write("Primeras filas:", gdf.head(5))
+            st.write("Sidecars faltantes:", miss)
+        raise AttributeError(f"La capa {label} se leyó sin geometría activa.")
+
+    # CRS -> EPSG:4326 (para mapa)
+    try:
+        if gdf.crs is None:
+            st.warning(f"⚠️ {label} no trae CRS. Asumiendo EPSG:4326 para visualizar.")
+            gdf = gdf.set_crs(epsg=4326, allow_override=True)
+        gdf = gdf.to_crs(epsg=4326)
+    except Exception:
+        st.warning(f"⚠️ No pude convertir CRS de {label}. Intento forzar EPSG:4326.")
+        gdf = gdf.set_crs(epsg=4326, allow_override=True)
+
+    # limpiar nulos de geometría
+    gdf = gdf[gdf.geometry.notna()].copy()
+
+    # arreglar geometría (opcional)
     try:
         gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
@@ -187,7 +258,7 @@ def to_excel_bytes(df: pd.DataFrame, sheet: str = "RESUMEN") -> bytes:
 # =========================
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
-    ine_zip_file = st.file_uploader("ZIP INE — Secciones electorales (BGD)", type=["zip"])
+    ine_zip_file = st.file_uploader("ZIP INE — Secciones electorales", type=["zip"])
 with c2:
     inegi_zip_file = st.file_uploader("ZIP INEGI — Manzanas (Marco Geoestadístico)", type=["zip"])
 with c3:
@@ -200,108 +271,103 @@ if not ine_zip_file or not inegi_zip_file:
 ine_bytes = ine_zip_file.getvalue()
 inegi_bytes = inegi_zip_file.getvalue()
 
-# preparar workspaces
-with st.spinner("📦 Preparando ZIP INE (incluye ZIPs anidados)..."):
-    ws_ine, shps_ine = prepare_zip_workspace(ine_bytes, key="INE")
+with st.spinner("📦 Preparando ZIP INE..."):
+    ws_ine, shps_ine = prepare_zip_workspace(ine_bytes, "INE")
+with st.spinner("📦 Preparando ZIP INEGI..."):
+    ws_inegi, shps_inegi = prepare_zip_workspace(inegi_bytes, "INEGI")
 
-with st.spinner("📦 Preparando ZIP INEGI (incluye ZIPs anidados)..."):
-    ws_inegi, shps_inegi = prepare_zip_workspace(inegi_bytes, key="INEGI")
-
-# Validación fuerte (aquí ya no tronamos con FileNotFoundError)
 if not shps_ine:
-    st.error("No encontré ningún .shp dentro del ZIP del INE (ni dentro de ZIPs anidados).")
-    st.write("Archivos detectados (muestra):", _list_files(ws_ine, limit=200))
+    st.error("No encontré ningún .shp dentro del ZIP del INE.")
     st.stop()
-
 if not shps_inegi:
-    st.error("No encontré ningún .shp dentro del ZIP del INEGI (ni dentro de ZIPs anidados).")
-    st.write("Archivos detectados (muestra):", _list_files(ws_inegi, limit=200))
+    st.error("No encontré ningún .shp dentro del ZIP del INEGI.")
     st.stop()
 
-# selector con filtro (para listas largas)
 st.divider()
 st.subheader("🧩 Elige las capas correctas (.shp)")
 
 f1, f2 = st.columns(2)
 with f1:
-    fil_ine = st.text_input("Filtrar lista INE (ej: secc, seccion, sección)", value="secc")
+    fil_ine = st.text_input("Filtrar lista INE (ej: secc, seccion)", value="secc")
 with f2:
-    fil_inegi = st.text_input("Filtrar lista INEGI (ej: mza, manzana)", value="mza")
+    fil_inegi = st.text_input("Filtrar lista INEGI (tip: escribe 'm.shp' o '25m')", value="25m")
 
-def _filter_list(items: List[str], q: str) -> List[str]:
+def _filter(items: List[str], q: str) -> List[str]:
     q = (q or "").strip().lower()
     if not q:
         return items
     return [x for x in items if q in x.lower()]
 
-shps_ine_view = _filter_list(shps_ine, fil_ine)
-shps_inegi_view = _filter_list(shps_inegi, fil_inegi)
+ine_view = _filter(shps_ine, fil_ine) or shps_ine
+inegi_view = _filter(shps_inegi, fil_inegi) or shps_inegi
 
-if not shps_ine_view:
-    shps_ine_view = shps_ine
-if not shps_inegi_view:
-    shps_inegi_view = shps_inegi
+# autoselección
+ine_idx = _auto_pick_shp(ine_view, "ine_seccion")
+inegi_idx = _auto_pick_shp(inegi_view, "inegi_manzana")
 
 cA, cB = st.columns(2)
 with cA:
-    shp_ine_choice = st.selectbox("INE: elige SHP de SECCIONES", shps_ine_view, index=0)
+    shp_ine_choice = st.selectbox("INE: SHP de SECCIONES", ine_view, index=min(ine_idx, len(ine_view)-1))
 with cB:
-    shp_inegi_choice = st.selectbox("INEGI: elige SHP de MANZANAS", shps_inegi_view, index=0)
+    shp_inegi_choice = st.selectbox("INEGI: SHP de MANZANAS", inegi_view, index=min(inegi_idx, len(inegi_view)-1))
 
-# cargar capas
-with st.spinner("🧠 Leyendo capas seleccionadas..."):
-    secc = read_gdf(ws_ine, shp_ine_choice)
-    mza = read_gdf(ws_inegi, shp_inegi_choice)
+# aviso si eligieron AGEB por error
+if re.search(r"(^|/)\d{2}a\.shp$", shp_inegi_choice.lower()):
+    st.warning("⚠️ Ese archivo parece **AGEB (..a.shp)**, no manzana. Busca **..m.shp** (ej: 25m.shp).")
 
-st.success(f"INE Secciones: {len(secc):,} | INEGI Manzanas: {len(mza):,}")
+with st.spinner("🧠 Leyendo capas..."):
+    try:
+        secc = read_gdf(ws_ine, shp_ine_choice, label="INE (Secciones)")
+    except Exception as e:
+        st.error(f"No pude leer INE (Secciones): {e}")
+        st.stop()
+
+    try:
+        mza = read_gdf(ws_inegi, shp_inegi_choice, label="INEGI (Manzanas)")
+    except Exception as e:
+        st.error(f"No pude leer INEGI (Manzanas): {e}")
+        st.stop()
+
+st.success(f"INE Secciones: {len(secc):,} | INEGI Capa: {len(mza):,}")
 
 # =========================
-# Config columnas y filtros
+# Columnas / filtros
 # =========================
 st.divider()
-st.subheader("🎛️ Columnas / filtros (para quedarte solo con Ahome / Distrito 05 si existe)")
+st.subheader("🎛️ Columnas / filtros")
 
-guess_seccion = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC", "SECCION_E", "SECCION_I"])
-guess_distrito = pick_col(list(secc.columns), ["DISTRITO", "DTO", "DIST", "DISTRITO_F", "DISTRITO_L", "CVE_DIST"])
+guess_seccion = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC"])
+guess_distrito = pick_col(list(secc.columns), ["DISTRITO", "DTO", "DIST", "CVE_DIST"])
 guess_mun = pick_col(list(secc.columns), ["MUNICIPIO", "NOM_MUN", "NOM_MPIO", "CVE_MUN", "MUN"])
 
 k1, k2, k3 = st.columns(3)
 with k1:
     secc_id_col = st.selectbox(
-        "Columna ID de sección",
+        "Columna ID de Sección",
         options=sorted(secc.columns),
         index=(sorted(secc.columns).index(guess_seccion) if guess_seccion in secc.columns else 0),
     )
 with k2:
-    distrito_col = st.selectbox(
-        "Columna distrito (opcional)",
-        options=["(no usar)"] + sorted(secc.columns),
-        index=(1 + sorted(secc.columns).index(guess_distrito) if guess_distrito in secc.columns else 0),
-    )
+    distrito_col = st.selectbox("Columna Distrito (opcional)", options=["(no usar)"] + sorted(secc.columns), index=0)
 with k3:
-    mun_col = st.selectbox(
-        "Columna municipio (opcional)",
-        options=["(no usar)"] + sorted(secc.columns),
-        index=(1 + sorted(secc.columns).index(guess_mun) if guess_mun in secc.columns else 0),
-    )
+    mun_col = st.selectbox("Columna Municipio (opcional)", options=["(no usar)"] + sorted(secc.columns), index=0)
 
 secc_f = secc.copy()
 
 if distrito_col != "(no usar)":
     vals = sorted(secc_f[distrito_col].dropna().astype(str).unique().tolist())
-    distrito_sel = st.selectbox("Filtrar por distrito", ["(todos)"] + vals, index=0)
+    distrito_sel = st.selectbox("Filtrar distrito", ["(todos)"] + vals, index=0)
     if distrito_sel != "(todos)":
         secc_f = secc_f[secc_f[distrito_col].astype(str) == str(distrito_sel)].copy()
 
 if mun_col != "(no usar)":
     vals = sorted(secc_f[mun_col].dropna().astype(str).unique().tolist())
-    # intento default Ahome
     def_idx = 0
     for i, v in enumerate(vals):
         if "ahome" in str(v).lower():
             def_idx = i + 1
             break
-    mun_sel = st.selectbox("Filtrar por municipio", ["(todos)"] + vals, index=def_idx)
+    mun_sel = st.selectbox("Filtrar municipio", ["(todos)"] + vals, index=def_idx)
     if mun_sel != "(todos)":
         secc_f = secc_f[secc_f[mun_col].astype(str) == str(mun_sel)].copy()
 
@@ -309,14 +375,14 @@ if secc_f.empty:
     st.error("Con esos filtros no quedó ninguna sección.")
     st.stop()
 
-# recorte bbox (performance)
+# performance: bbox
 minx, miny, maxx, maxy = secc_f.total_bounds
 mza_f = mza.cx[minx:maxx, miny:maxy].copy()
 if mza_f.empty:
-    st.warning("No quedaron manzanas dentro del bbox de las secciones filtradas (revisa que sí sea capa de MANZANA).")
+    st.warning("No quedaron elementos INEGI dentro del bbox. OJO: tal vez no elegiste manzanas.")
     st.stop()
 
-st.write(f"Secciones filtradas: **{len(secc_f):,}** | Manzanas (bbox): **{len(mza_f):,}**")
+st.write(f"Secciones filtradas: **{len(secc_f):,}** | Elementos INEGI (bbox): **{len(mza_f):,}**")
 
 # =========================
 # Conteo
@@ -326,12 +392,10 @@ st.subheader("📊 Conteo de manzanas por sección")
 
 pred = st.selectbox("Regla espacial", ["intersects", "within"], index=0)
 run = st.button("🚀 Calcular conteo", use_container_width=True)
-
 if not run:
     st.stop()
 
 with st.spinner("Cruzando (sjoin) y contando..."):
-    # Proyectar a 3857 para join más estable
     secc_p = secc_f.to_crs(epsg=3857)
     mza_p = mza_f.to_crs(epsg=3857)
 
@@ -347,6 +411,7 @@ with st.spinner("Cruzando (sjoin) y contando..."):
     secc_out = secc_f.copy()
     secc_out[secc_id_col] = secc_out[secc_id_col].astype(str)
     counts[secc_id_col] = counts[secc_id_col].astype(str)
+
     secc_out = secc_out.merge(counts, on=secc_id_col, how="left")
     secc_out["MANZANAS"] = secc_out["MANZANAS"].fillna(0).astype(int)
 
@@ -361,29 +426,20 @@ cT, cM = st.columns([1, 1.35])
 
 with cT:
     st.dataframe(counts, use_container_width=True, height=560)
-
+    st.download_button("⬇️ CSV", counts.to_csv(index=False).encode("utf-8"), "conteo_manzanas_por_seccion.csv", "text/csv", use_container_width=True)
     st.download_button(
-        "⬇️ Descargar CSV",
-        data=counts.to_csv(index=False).encode("utf-8"),
-        file_name="conteo_manzanas_por_seccion.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    st.download_button(
-        "⬇️ Descargar Excel",
-        data=to_excel_bytes(counts, sheet="MANZANAS_X_SECCION"),
-        file_name="conteo_manzanas_por_seccion.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇️ Excel",
+        to_excel_bytes(counts, sheet="MANZANAS_X_SECCION"),
+        "conteo_manzanas_por_seccion.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
 with cM:
     st.subheader("🗺️ Mapa (coloreado por conteo)")
-
     lat, lon = safe_center(secc_out)
     m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True)
 
-    # basemap
     if basemap == "Relieve (Esri)":
         folium.TileLayer(
             tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
@@ -403,7 +459,6 @@ with cM:
     else:
         folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(m)
 
-    # estilo por rangos
     def style_fn(feat):
         v = int(feat["properties"].get("MANZANAS", 0))
         if v == 0:
@@ -418,11 +473,9 @@ with cM:
     aliases = ["Sección:", "Manzanas:"]
 
     if distrito_col != "(no usar)":
-        tooltip_fields.append(distrito_col)
-        aliases.append("Distrito:")
+        tooltip_fields.append(distrito_col); aliases.append("Distrito:")
     if mun_col != "(no usar)":
-        tooltip_fields.append(mun_col)
-        aliases.append("Municipio:")
+        tooltip_fields.append(mun_col); aliases.append("Municipio:")
 
     folium.GeoJson(
         secc_out.to_json(),
@@ -432,7 +485,6 @@ with cM:
     ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
-
     b = secc_out.total_bounds
     m.fit_bounds([[b[1], b[0]], [b[3], b[2]]])
 
