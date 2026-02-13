@@ -1,4 +1,6 @@
-streamlit==1.32.0
-pandas==2.2.2
-pydeck==0.8.1b0
-
+streamlit
+pandas
+numpy
+geopandas==1.1.2
+folium
+streamlit-folium
