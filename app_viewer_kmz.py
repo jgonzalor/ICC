@@ -3,16 +3,11 @@
 # 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
 # ✅ Filtro por VARIAS SECCIONES (multiselect)
-# ✅ Secciones con color distinto (por sección) + etiquetas visibles (número de sección)
-# ✅ Exportar a KMZ con POLÍGONOS COLOREADOS (por sección)  ← (lo que pediste)
+# ✅ Secciones con color distinto + etiquetas visibles en el mapa (número de sección)
+# ✅ Exportar a KMZ con:
+#    - Polígonos coloreados por sección
+#    - Etiquetas (labels) por sección (opcional) como puntos sin ícono (más confiable en Google Earth)
 # ✅ “Imprimir pantalla”: descarga del HTML del mapa (ábrelo en navegador y Ctrl+P / Imprimir)
-#
-# - Sube SOLO 1 ZIP que contenga ambos SHP:
-#     * Secciones (INE): ...SECCION*.shp o ...SECCIONES*.shp
-#     * Manzanas (INEGI): ...MANZANAS*.shp o ...25m.shp
-# - Filtros: Distrito local/federal, Municipio y (multi) Sección
-# - Mapa base: relieve/topo/calles/satélite
-# - Tablas + export CSV/Excel/KMZ/HTML del mapa
 
 from __future__ import annotations
 
@@ -55,6 +50,7 @@ def safe_extract_zip_bytes(zip_bytes: bytes, out_dir: str) -> None:
         try:
             z.extractall(out_dir)
         except Exception:
+            # extracción "best effort"
             for n in z.namelist():
                 try:
                     z.extract(n, out_dir)
@@ -217,7 +213,7 @@ def color_for_section(section_value) -> str:
 
 
 # -------------------------
-# KML / KMZ export helpers (con estilos por sección)
+# KML / KMZ export helpers (con estilos + etiquetas)
 # -------------------------
 def xml_escape(s: str) -> str:
     s = "" if s is None else str(s)
@@ -244,7 +240,12 @@ def kml_color_from_hex(hex_rgb: str, alpha: int = 140) -> str:
 
 def style_id_for(val) -> str:
     s = "S_" + re.sub(r"[^A-Za-z0-9_]+", "_", str(val))
-    return s[:60]  # corto
+    return s[:60]
+
+
+def label_style_id_for(val) -> str:
+    s = "LBL_" + re.sub(r"[^A-Za-z0-9_]+", "_", str(val))
+    return s[:60]
 
 
 def iter_polygons(geom) -> Iterable:
@@ -299,32 +300,56 @@ def geom_to_kml(geom) -> str:
     return f"<MultiGeometry>\n{parts}\n</MultiGeometry>"
 
 
-def build_section_styles(secc_gdf: gpd.GeoDataFrame, section_col: Optional[str], alpha_fill: int = 140) -> Tuple[str, Dict[str, str]]:
+def build_section_styles(
+    secc_gdf: gpd.GeoDataFrame,
+    section_col: Optional[str],
+    alpha_fill: int = 140,
+    label_scale: float = 1.2,
+) -> Tuple[str, Dict[str, str], Dict[str, str]]:
     """
     Retorna:
-      - styles_xml: <Style ...>...</Style> concatenado
-      - value_to_styleid: dict(str(section)->styleId)
+      - styles_xml: estilos de polígonos + estilos de etiquetas (puntos)
+      - value_to_poly_styleid: dict(str(section)->polyStyleId)
+      - value_to_lbl_styleid: dict(str(section)->labelStyleId)
     """
     if not section_col or section_col not in secc_gdf.columns:
-        return "", {}
+        return "", {}, {}
 
     values = sorted(secc_gdf[section_col].dropna().astype(str).unique().tolist())
-    mapping: Dict[str, str] = {}
+    poly_map: Dict[str, str] = {}
+    lbl_map: Dict[str, str] = {}
     style_chunks = []
 
     for v in values:
-        sid = style_id_for(v)
-        mapping[v] = sid
+        poly_id = style_id_for(v)
+        lbl_id = label_style_id_for(v)
+        poly_map[v] = poly_id
+        lbl_map[v] = lbl_id
+
         hex_rgb = color_for_section(v)
-        poly = kml_color_from_hex(hex_rgb, alpha=alpha_fill)
-        line = "ff000000"  # negro opaco
+        poly_color = kml_color_from_hex(hex_rgb, alpha=alpha_fill)
+        line_color = "ff000000"  # negro
+        label_color = "ff111111"  # casi negro
+
+        # Polígono
         style_chunks.append(f"""
-  <Style id="{xml_escape(sid)}">
-    <LineStyle><color>{line}</color><width>2</width></LineStyle>
-    <PolyStyle><color>{poly}</color><fill>1</fill><outline>1</outline></PolyStyle>
+  <Style id="{xml_escape(poly_id)}">
+    <LineStyle><color>{line_color}</color><width>2</width></LineStyle>
+    <PolyStyle><color>{poly_color}</color><fill>1</fill><outline>1</outline></PolyStyle>
+    <LabelStyle><color>{label_color}</color><scale>{label_scale:.2f}</scale></LabelStyle>
   </Style>
         """)
-    return "\n".join(style_chunks), mapping
+
+        # Etiqueta como punto sin ícono (solo texto)
+        # IconStyle scale=0 para ocultar el ícono (queda el label del <name>)
+        style_chunks.append(f"""
+  <Style id="{xml_escape(lbl_id)}">
+    <IconStyle><scale>0</scale></IconStyle>
+    <LabelStyle><color>{label_color}</color><scale>{label_scale:.2f}</scale></LabelStyle>
+  </Style>
+        """)
+
+    return "\n".join(style_chunks), poly_map, lbl_map
 
 
 def gdf_to_kml_folder(
@@ -353,7 +378,6 @@ def gdf_to_kml_folder(
         else:
             nm = str(row.get("SECCION") or row.get("SECC") or "")
 
-        # style url (por sección)
         style_url = ""
         if style_by_col and style_map and style_by_col in gdf2.columns:
             key = row.get(style_by_col)
@@ -381,6 +405,30 @@ def gdf_to_kml_folder(
     return f"<Folder><name>{xml_escape(folder_name)}</name>{''.join(placemarks)}</Folder>"
 
 
+def gdf_to_kml_labels_folder(
+    secc_gdf: gpd.GeoDataFrame,
+    folder_name: str,
+    section_col: str,
+    label_style_map: Dict[str, str],
+) -> str:
+    placemarks = []
+    for _, row in secc_gdf.iterrows():
+        sec_val = row.get(section_col)
+        if sec_val is None or pd.isna(sec_val):
+            continue
+        sec_key = str(sec_val)
+        sid = label_style_map.get(sec_key)
+        pt = row.geometry.representative_point()
+        placemarks.append(f"""
+        <Placemark>
+          <name>{xml_escape(sec_key)}</name>
+          {"<styleUrl>#"+xml_escape(sid)+"</styleUrl>" if sid else ""}
+          <Point><coordinates>{pt.x:.8f},{pt.y:.8f},0</coordinates></Point>
+        </Placemark>
+        """)
+    return f"<Folder><name>{xml_escape(folder_name)}</name>{''.join(placemarks)}</Folder>"
+
+
 def build_kml_document(
     secc_gdf: gpd.GeoDataFrame,
     mza_gdf: Optional[gpd.GeoDataFrame],
@@ -389,16 +437,27 @@ def build_kml_document(
     name_col_mza: Optional[str],
     max_manzanas: int,
     alpha_fill: int = 140,
+    label_scale: float = 1.2,
+    include_labels: bool = True,
 ) -> str:
-    styles_xml, style_map = build_section_styles(secc_gdf, section_col_for_style, alpha_fill=alpha_fill)
+    styles_xml, poly_style_map, lbl_style_map = build_section_styles(
+        secc_gdf, section_col_for_style, alpha_fill=alpha_fill, label_scale=label_scale
+    )
 
     folders = []
     folders.append(
         gdf_to_kml_folder(
-            secc_gdf, "SECCIONES", name_col_secc, max_features=len(secc_gdf),
-            style_by_col=section_col_for_style, style_map=style_map
+            secc_gdf,
+            "SECCIONES",
+            name_col_secc,
+            max_features=len(secc_gdf),
+            style_by_col=section_col_for_style,
+            style_map=poly_style_map,
         )
     )
+    if include_labels and section_col_for_style and lbl_style_map:
+        folders.append(gdf_to_kml_labels_folder(secc_gdf, "ETIQUETAS_SECCIONES", section_col_for_style, lbl_style_map))
+
     if mza_gdf is not None and len(mza_gdf) > 0:
         folders.append(gdf_to_kml_folder(mza_gdf, "MANZANAS", name_col_mza, max_features=max_manzanas))
 
@@ -774,35 +833,39 @@ with tab_export:
     )
 
     st.divider()
-    st.subheader("🗺️ Exportar KMZ (Google Earth) — con colores por sección")
+    st.subheader("🗺️ Exportar KMZ (Google Earth) — con colores + etiquetas de sección")
 
     include_manz = st.checkbox("Incluir manzanas en el KMZ (puede pesar)", value=False)
     max_mz = st.slider("Límite máximo de manzanas en KMZ", min_value=500, max_value=20000, value=6000, step=500)
     alpha = st.slider("Transparencia relleno (KMZ)", min_value=40, max_value=220, value=140, step=10,
                       help="Más alto = más opaco. Se aplica al relleno de las secciones en el KMZ.")
+    include_kmz_labels = st.checkbox("Incluir etiquetas (número de sección) en el KMZ", value=True)
+    kmz_label_scale = st.slider("Tamaño etiqueta (KMZ)", min_value=0.6, max_value=3.0, value=1.3, step=0.1)
 
     if st.button("Preparar KMZ", use_container_width=True):
         with st.spinner("Generando KMZ..."):
             mza_for_kmz = mza_bbox if include_manz else None
             kml = build_kml_document(
-                secc_f,
-                mza_for_kmz,
+                secc_gdf=secc_f,
+                mza_gdf=mza_for_kmz,
                 section_col_for_style=col_sec if col_sec else None,
                 name_col_secc=col_sec if col_sec else None,
                 name_col_mza=mza_sec if mza_sec else None,
                 max_manzanas=max_mz,
                 alpha_fill=int(alpha),
+                label_scale=float(kmz_label_scale),
+                include_labels=bool(include_kmz_labels),
             )
             kmz_bytes = kml_to_kmz_bytes(kml, "doc.kml")
             st.session_state["LAST_KMZ"] = kmz_bytes
-        st.success("KMZ listo ✅ (ya va coloreado por sección)")
+        st.success("KMZ listo ✅ (coloreado + etiquetas)")
 
     kmz_bytes = st.session_state.get("LAST_KMZ")
     if kmz_bytes:
         st.download_button(
             "⬇️ Descargar KMZ",
             data=kmz_bytes,
-            file_name="export_secciones_manzanas_coloreado.kmz",
+            file_name="export_secciones_manzanas_coloreado_etiquetas.kmz",
             mime="application/vnd.google-earth.kmz",
             use_container_width=True
         )
@@ -823,4 +886,4 @@ with tab_export:
         )
         st.caption("Abre el HTML en tu navegador y usa **Ctrl+P / Imprimir** (o “Guardar como PDF”).")
 
-st.success("✅ Listo. El KMZ ahora exporta las secciones COLOREADAS por sección.")
+st.success("✅ Listo. El KMZ ahora incluye etiquetas por sección (folder ETIQUETAS_SECCIONES).")
