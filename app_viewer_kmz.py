@@ -1,412 +1,408 @@
 # app_viewer_kmz.py
-# ICC — Secciones INE + Manzanas INEGI (Marco Geoestadístico)
-# - Mapa con estilo "relieve" (OpenTopoMap / Esri Shaded Relief)
-# - Conteo de manzanas (cuadras) por sección
-# - Descarga a Excel
+# Conteo de MANZANAS (cuadras) por SECCIÓN electoral (INE x INEGI)
+# + mapa base con relieve/topo/calles
 #
 # Uso:
-# 1) Sube ZIP INE (Secciones electorales)
-# 2) Sube ZIP INEGI (Manzanas del Marco Geoestadístico)
-# 3) Filtra por campos (Entidad/Municipio/Distrito si aplica)
-# 4) Calcula conteos y visualiza en mapa
+# 1) Sube ZIP INE (Secciones electorales)  -> SHP dentro del ZIP
+# 2) Sube ZIP INEGI (Manzanas)            -> SHP dentro del ZIP
+# 3) Elige columna de "SECCION" (y filtra por municipio/distrito si existen)
+# 4) Calcula conteo de manzanas por sección (spatial join)
+# 5) Mapa coloreado por conteo + tabla + descargas
+#
+# NOTA: Para que no truene la app, NO dibuja todas las manzanas.
+#       Solo (opcional) dibuja manzanas cuando seleccionas una sección.
 
 from __future__ import annotations
 
+import io
 import os
 import zipfile
 import tempfile
-from io import BytesIO
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
-import pandas as pd
 import streamlit as st
 
-import geopandas as gpd
-from shapely.geometry import mapping
+st.set_page_config(page_title="INE x INEGI — Manzanas por Sección", page_icon="🗺️", layout="wide")
 
+# --- imports pesados después de set_page_config ---
+try:
+    import geopandas as gpd
+except ModuleNotFoundError:
+    st.error("Falta instalar `geopandas`. Revisa tu requirements.txt (abajo te lo dejo).")
+    st.stop()
+
+import pandas as pd
 import folium
-from folium.features import GeoJsonTooltip
 from streamlit_folium import st_folium
 
 
 # =========================
-#   CONFIG
+# Helpers ZIP / SHP
 # =========================
-st.set_page_config(
-    page_title="ICC — Manzanas por Sección (INE + INEGI)",
-    page_icon="🗺️",
-    layout="wide",
-    menu_items={"Get Help": None, "Report a bug": None, "About": None},
-)
-
-st.markdown(
-    """
-<style>
-#MainMenu {visibility: hidden;}
-header {visibility: hidden;}
-footer {visibility: hidden;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.title("🗺️ ICC — Manzanas (cuadras) por Sección Electoral")
-st.caption(
-    "Sube los ZIP de **INE (Secciones)** y **INEGI (Manzanas)**. "
-    "Luego contamos cuántas manzanas caen dentro de cada sección y lo vemos en mapa con estilo relieve."
-)
-
-with st.expander("📌 ¿De dónde salen los ZIP oficiales? (INE / INEGI)", expanded=False):
-    st.markdown(
-        """
-**INE – Secciones electorales (Base Geográfica Digital / Marco Geoelectoral)**  
-- Descarga desde el portal de cartografía del INE (bases cartográficas) o repositorios públicos oficiales.  
-
-**INEGI – Manzanas (Marco Geoestadístico)**  
-- Descarga desde la sección de descargas del Marco Geoestadístico (capas de manzana).
-
-> Nota: el ZIP de INEGI trae **geometría**; para “casas por manzana” necesitas además **tabla censal** (viviendas) y luego se une por clave geoestadística.
-"""
-    )
+def zip_list_shps(zip_bytes: bytes) -> List[str]:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        return sorted([n for n in z.namelist() if n.lower().endswith(".shp")])
 
 
-# =========================
-#   UTILIDADES
-# =========================
-def _extract_zip_to_temp(uploaded: BytesIO) -> str:
-    """Extrae un ZIP de Streamlit a una carpeta temporal y regresa la ruta."""
-    tmpdir = tempfile.mkdtemp(prefix="icc_zip_")
-    with zipfile.ZipFile(uploaded) as z:
+def unzip_to_temp(zip_bytes: bytes) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="shp_")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
         z.extractall(tmpdir)
     return tmpdir
 
 
-def _find_first_shp(folder: str) -> str:
-    """Busca el primer .shp dentro de folder (recursivo)."""
-    for root, _, files in os.walk(folder):
-        for f in files:
-            if f.lower().endswith(".shp"):
-                return os.path.join(root, f)
-    raise FileNotFoundError("No se encontró ningún archivo .shp dentro del ZIP.")
+def read_shp_from_zip(zip_bytes: bytes, shp_inside_zip: str) -> gpd.GeoDataFrame:
+    tmpdir = unzip_to_temp(zip_bytes)
+    shp_path = os.path.join(tmpdir, shp_inside_zip)
 
+    if not os.path.exists(shp_path):
+        # Algunas veces el ZIP trae rutas raras; buscamos por nombre base
+        base = os.path.basename(shp_inside_zip).lower()
+        found = None
+        for root, _, files in os.walk(tmpdir):
+            for f in files:
+                if f.lower() == base and f.lower().endswith(".shp"):
+                    found = os.path.join(root, f)
+                    break
+            if found:
+                break
+        if not found:
+            raise FileNotFoundError("No encontré el .shp seleccionado dentro del ZIP.")
+        shp_path = found
 
-@st.cache_data(show_spinner=False)
-def load_gdf_from_zip(uploaded_file) -> gpd.GeoDataFrame:
-    """Carga un GeoDataFrame desde un ZIP subido en Streamlit."""
-    # Streamlit UploadedFile soporta .getvalue()
-    data = uploaded_file.getvalue()
-    folder = _extract_zip_to_temp(BytesIO(data))
-    shp_path = _find_first_shp(folder)
-
-    # Lee shapefile
     gdf = gpd.read_file(shp_path)
 
-    # Arreglos básicos de geometría
+    # limpieza mínima
     gdf = gdf[gdf.geometry.notna()].copy()
+    gdf.columns = [str(c).strip().upper() for c in gdf.columns]
+
+    # CRS -> WGS84 para mapa
+    if gdf.crs is None:
+        # si viene sin CRS, asumimos WGS84 para que no truene el mapa
+        gdf = gdf.set_crs(epsg=4326, allow_override=True)
+    gdf = gdf.to_crs(epsg=4326)
+
+    # intentar arreglar geometrías inválidas (sin romper)
     try:
-        # intentamos corregir geometrías inválidas de forma segura
-        gdf["geometry"] = gdf["geometry"].buffer(0)
+        gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
         pass
 
     return gdf
 
 
-def to_epsg4326(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    if gdf.crs is None:
-        # Si viene sin CRS, lo más común es EPSG:4326 o EPSG:6372/6362 (INEGI).
-        # Aquí no adivinamos: asumimos 4326 para que el mapa no truene, pero avisamos.
-        st.warning("⚠️ El shapefile viene sin CRS. Asumiendo EPSG:4326 para visualización.")
-        gdf = gdf.set_crs(epsg=4326, allow_override=True)
-    if str(gdf.crs).lower() != "epsg:4326":
-        gdf = gdf.to_crs(epsg=4326)
-    return gdf
-
-
-def pick_column(candidates: List[str], cols: List[str]) -> Optional[str]:
-    """Devuelve el primer match por nombre (case-insensitive)."""
-    cols_l = {c.lower(): c for c in cols}
+def pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
+    cols_u = {c.upper() for c in cols}
     for cand in candidates:
-        if cand.lower() in cols_l:
-            return cols_l[cand.lower()]
+        if cand.upper() in cols_u:
+            return cand.upper()
     return None
 
 
-def safe_str_series(s: pd.Series) -> pd.Series:
-    return s.astype(str).fillna("")
+def safe_center(gdf: gpd.GeoDataFrame) -> Tuple[float, float]:
+    minx, miny, maxx, maxy = gdf.total_bounds
+    return ( (miny + maxy) / 2.0, (minx + maxx) / 2.0 )
 
 
-def guess_id_columns(gdf: gpd.GeoDataFrame) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    cols = list(gdf.columns)
-
-    col_seccion = pick_column(["seccion", "sec", "cve_secc", "cve_sec", "id_secc"], cols)
-    col_distrito = pick_column(["distrito", "dist", "dto", "cve_dist"], cols)
-    col_municipio = pick_column(["municipio", "mun", "cve_mun", "nom_mun"], cols)
-
-    return col_seccion, col_distrito, col_municipio
-
-
-def spatial_count_manzanas_por_seccion(
-    secciones: gpd.GeoDataFrame,
-    manzanas: gpd.GeoDataFrame,
-    seccion_id_col: str,
-) -> pd.DataFrame:
-    """Spatial join manzanas->secciones y cuenta manzanas por sección."""
-    secc = secciones[[seccion_id_col, "geometry"]].copy()
-    manz = manzanas[["geometry"]].copy()
-
-    # Join: manzana intersecta sección
-    joined = gpd.sjoin(manz, secc, predicate="intersects", how="left")
-
-    counts = (
-        joined.groupby(seccion_id_col, dropna=False)
-        .size()
-        .reset_index(name="manzanas_conteo")
-    )
-
-    # Limpieza de nulos
-    counts[seccion_id_col] = counts[seccion_id_col].astype(str)
-
-    return counts
-
-
-def make_relief_map(
-    secciones: gpd.GeoDataFrame,
-    manzanas: Optional[gpd.GeoDataFrame] = None,
-    tooltip_fields: Optional[List[str]] = None,
-) -> folium.Map:
-    # Centro aproximado
-    bounds = secciones.total_bounds  # (minx, miny, maxx, maxy)
-    center_lat = (bounds[1] + bounds[3]) / 2
-    center_lon = (bounds[0] + bounds[2]) / 2
-
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=12, control_scale=True, tiles=None)
-
-    # Base layers (relieve/topo)
-    folium.TileLayer(
-        tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-        attr="© OpenTopoMap (CC-BY-SA)",
-        name="Relieve (OpenTopoMap)",
-        overlay=False,
-        control=True,
-        max_zoom=17,
-    ).add_to(m)
-
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
-        attr="Tiles © Esri — World Shaded Relief",
-        name="Relieve (Esri Shaded)",
-        overlay=False,
-        control=True,
-        max_zoom=13,
-    ).add_to(m)
-
-    folium.TileLayer(
-        tiles="OpenStreetMap",
-        name="Calles (OSM)",
-        overlay=False,
-        control=True,
-    ).add_to(m)
-
-    # Secciones (relleno suave)
-    tooltip_fields = tooltip_fields or []
-    tooltip_fields = [f for f in tooltip_fields if f in secciones.columns]
-
-    secc_json = folium.GeoJson(
-        data=secciones.__geo_interface__,
-        name="Secciones (INE)",
-        style_function=lambda _: {
-            "weight": 2,
-            "fillOpacity": 0.08,
-        },
-        tooltip=GeoJsonTooltip(fields=tooltip_fields) if tooltip_fields else None,
-    )
-    secc_json.add_to(m)
-
-    # Manzanas (borde)
-    if manzanas is not None and len(manzanas) > 0:
-        folium.GeoJson(
-            data=manzanas.__geo_interface__,
-            name="Manzanas (INEGI)",
-            style_function=lambda _: {"weight": 1, "fillOpacity": 0.0},
-        ).add_to(m)
-
-    folium.LayerControl(collapsed=False).add_to(m)
-    folium.FitBounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]]).add_to(m)
-
-    return m
-
-
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "RESUMEN") -> bytes:
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+def to_excel_bytes(df: pd.DataFrame, sheet="RESUMEN") -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name=sheet)
     return out.getvalue()
 
 
 # =========================
-#   UI: CARGA DE ARCHIVOS
+# UI
 # =========================
-col1, col2 = st.columns(2)
+st.title("🗺️ Manzanas (cuadras) por Sección Electoral — INE x INEGI")
+st.caption("Sube los ZIP oficiales (INE Secciones + INEGI Manzanas). El app cuenta cuántas manzanas caen dentro de cada sección.")
 
-with col1:
-    zip_ine = st.file_uploader(
-        "ZIP INE — Secciones electorales",
-        type=["zip"],
-        accept_multiple_files=False,
-    )
-
-with col2:
-    zip_inegi = st.file_uploader(
-        "ZIP INEGI — Manzanas (Marco Geoestadístico)",
-        type=["zip"],
-        accept_multiple_files=False,
-    )
-
-if not zip_ine or not zip_inegi:
-    st.info("👆 Sube ambos ZIP (INE y INEGI) para continuar.")
-    st.stop()
-
-with st.spinner("Cargando shapefiles..."):
-    gdf_secciones = load_gdf_from_zip(zip_ine)
-    gdf_manzanas = load_gdf_from_zip(zip_inegi)
-
-gdf_secciones = to_epsg4326(gdf_secciones)
-gdf_manzanas = to_epsg4326(gdf_manzanas)
-
-st.success(
-    f"Listo: INE(secciones)={len(gdf_secciones):,} registros | INEGI(manzanas)={len(gdf_manzanas):,} registros"
-)
-
-# =========================
-#   FILTROS / CAMPOS
-# =========================
-st.subheader("🎛️ Filtros")
-
-col_secc, col_dist, col_mun = guess_id_columns(gdf_secciones)
-
-c1, c2, c3 = st.columns(3)
+c1, c2, c3 = st.columns([1, 1, 1])
 
 with c1:
-    seccion_id_col = st.selectbox(
-        "Campo de ID de Sección",
-        options=list(gdf_secciones.columns),
-        index=(list(gdf_secciones.columns).index(col_secc) if col_secc in gdf_secciones.columns else 0),
-    )
+    ine_zip_file = st.file_uploader("ZIP INE — Secciones electorales (SHP en ZIP)", type=["zip"])
 
 with c2:
-    distrito_col = st.selectbox(
-        "Campo de Distrito (si existe)",
-        options=["(no usar)"] + list(gdf_secciones.columns),
-        index=(1 + list(gdf_secciones.columns).index(col_dist) if col_dist in gdf_secciones.columns else 0),
-    )
+    inegi_zip_file = st.file_uploader("ZIP INEGI — Manzanas (Marco Geoestadístico) (SHP en ZIP)", type=["zip"])
 
 with c3:
-    municipio_col = st.selectbox(
-        "Campo de Municipio (si existe)",
-        options=["(no usar)"] + list(gdf_secciones.columns),
-        index=(1 + list(gdf_secciones.columns).index(col_mun) if col_mun in gdf_secciones.columns else 0),
-    )
+    basemap = st.selectbox("Basemap", ["Relieve (Esri)", "Topográfico (OpenTopoMap)", "Calles (OSM)"], index=0)
 
-gdf_secc_f = gdf_secciones.copy()
-
-# Filtrar por Distrito
-if distrito_col != "(no usar)":
-    dist_vals = sorted(safe_str_series(gdf_secc_f[distrito_col]).unique().tolist())
-    dist_sel = st.selectbox("Selecciona Distrito", options=dist_vals, index=0)
-    gdf_secc_f = gdf_secc_f[safe_str_series(gdf_secc_f[distrito_col]) == str(dist_sel)].copy()
-
-# Filtrar por Municipio
-if municipio_col != "(no usar)":
-    mun_vals = sorted(safe_str_series(gdf_secc_f[municipio_col]).unique().tolist())
-    default_idx = 0
-    # intento de “Ahome”
-    for i, v in enumerate(mun_vals):
-        if "ahome" in str(v).lower():
-            default_idx = i
-            break
-    mun_sel = st.selectbox("Selecciona Municipio", options=mun_vals, index=default_idx)
-    gdf_secc_f = gdf_secc_f[safe_str_series(gdf_secc_f[municipio_col]) == str(mun_sel)].copy()
-
-st.write(f"Secciones filtradas: **{len(gdf_secc_f):,}**")
-
-if len(gdf_secc_f) == 0:
-    st.error("No quedaron secciones con esos filtros. Ajusta Distrito/Municipio.")
+if not ine_zip_file or not inegi_zip_file:
+    st.info("👆 Sube ambos ZIP para continuar.")
     st.stop()
 
-# Clip opcional de manzanas a bbox de secciones filtradas (performance)
-minx, miny, maxx, maxy = gdf_secc_f.total_bounds
-bbox = gpd.GeoSeries.from_bbox((minx, miny, maxx, maxy), crs="EPSG:4326").iloc[0]
-gdf_manz_f = gdf_manzanas[gdf_manzanas.intersects(bbox)].copy()
+# Leer bytes sin “consumir” el UploadedFile
+ine_zip_bytes = ine_zip_file.getvalue()
+inegi_zip_bytes = inegi_zip_file.getvalue()
 
-st.write(f"Manzanas dentro del bbox: **{len(gdf_manz_f):,}**")
+ine_shps = zip_list_shps(ine_zip_bytes)
+inegi_shps = zip_list_shps(inegi_zip_bytes)
 
-# =========================
-#   CÁLCULO
-# =========================
-st.subheader("📊 Conteo de manzanas (cuadras) por sección")
+if not ine_shps:
+    st.error("El ZIP del INE no contiene .shp.")
+    st.stop()
+if not inegi_shps:
+    st.error("El ZIP del INEGI no contiene .shp.")
+    st.stop()
 
-do_calc = st.button("🚀 Calcular conteos", use_container_width=True)
+sel1, sel2 = st.columns(2)
+with sel1:
+    ine_shp_choice = st.selectbox("SHP dentro del ZIP INE (elige la capa de SECCIONES)", ine_shps, index=0)
+with sel2:
+    inegi_shp_choice = st.selectbox("SHP dentro del ZIP INEGI (elige la capa de MANZANAS)", inegi_shps, index=0)
 
-if do_calc:
-    with st.spinner("Haciendo spatial join y conteo..."):
-        df_counts = spatial_count_manzanas_por_seccion(
-            secciones=gdf_secc_f,
-            manzanas=gdf_manz_f,
-            seccion_id_col=seccion_id_col,
-        )
+with st.spinner("Leyendo shapefiles..."):
+    secc = read_shp_from_zip(ine_zip_bytes, ine_shp_choice)
+    mza = read_shp_from_zip(inegi_zip_bytes, inegi_shp_choice)
 
-        # Unir a tabla de secciones para tooltip/mapa/descargas
-        gdf_out = gdf_secc_f.copy()
-        gdf_out[seccion_id_col] = gdf_out[seccion_id_col].astype(str)
+st.success(f"INE Secciones: {len(secc):,} | INEGI Manzanas: {len(mza):,}")
 
-        gdf_out = gdf_out.merge(df_counts, on=seccion_id_col, how="left")
-        gdf_out["manzanas_conteo"] = gdf_out["manzanas_conteo"].fillna(0).astype(int)
+st.divider()
+st.subheader("🎛️ Configuración / filtros")
 
-        # Resumen
-        resumen = (
-            gdf_out[[seccion_id_col, "manzanas_conteo"]]
-            .sort_values("manzanas_conteo", ascending=False)
-            .reset_index(drop=True)
-        )
+# Detectores comunes
+guess_seccion = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC", "SECCION_E", "SECCION_I"])
+guess_distrito = pick_col(list(secc.columns), ["DISTRITO", "DTO", "DIST", "DISTRITO_F", "DISTRITO_L", "CVE_DIST"])
+guess_mun = pick_col(list(secc.columns), ["MUNICIPIO", "NOM_MUN", "NOM_MPIO", "CVE_MUN", "MUN"])
 
-    st.success("Conteo listo ✅")
+f1, f2, f3 = st.columns(3)
 
-    cA, cB, cC = st.columns(3)
-    with cA:
-        st.metric("Secciones", f"{len(gdf_out):,}")
-    with cB:
-        st.metric("Manzanas (cuadras) totales", f"{int(resumen['manzanas_conteo'].sum()):,}")
-    with cC:
-        st.metric("Promedio manzanas por sección", f"{resumen['manzanas_conteo'].mean():.2f}")
+with f1:
+    secc_id_col = st.selectbox(
+        "Columna de SECCIÓN (INE)",
+        options=sorted(secc.columns),
+        index=(sorted(secc.columns).index(guess_seccion) if guess_seccion in secc.columns else 0),
+    )
 
-    st.dataframe(resumen, use_container_width=True)
+with f2:
+    distrito_col = st.selectbox(
+        "Columna de DISTRITO (opcional)",
+        options=["(no usar)"] + sorted(secc.columns),
+        index=(1 + sorted(secc.columns).index(guess_distrito) if guess_distrito in secc.columns else 0),
+    )
 
-    # Descarga Excel
-    xls = df_to_excel_bytes(resumen, sheet_name="MANZANAS_X_SECCION")
+with f3:
+    mun_col = st.selectbox(
+        "Columna de MUNICIPIO (opcional)",
+        options=["(no usar)"] + sorted(secc.columns),
+        index=(1 + sorted(secc.columns).index(guess_mun) if guess_mun in secc.columns else 0),
+    )
+
+secc_f = secc.copy()
+
+# Filtro distrito
+if distrito_col != "(no usar)":
+    vals = sorted(secc_f[distrito_col].dropna().astype(str).unique().tolist())
+    distrito_sel = st.selectbox("Filtrar distrito", ["(todos)"] + vals, index=0)
+    if distrito_sel != "(todos)":
+        secc_f = secc_f[secc_f[distrito_col].astype(str) == str(distrito_sel)].copy()
+
+# Filtro municipio
+if mun_col != "(no usar)":
+    vals = sorted(secc_f[mun_col].dropna().astype(str).unique().tolist())
+    # intento poner Ahome como default si aparece
+    def_idx = 0
+    for i, v in enumerate(vals):
+        if "ahome" in str(v).lower():
+            def_idx = i + 1  # +1 porque "(todos)"
+            break
+    mun_sel = st.selectbox("Filtrar municipio", ["(todos)"] + vals, index=def_idx)
+    if mun_sel != "(todos)":
+        secc_f = secc_f[secc_f[mun_col].astype(str) == str(mun_sel)].copy()
+
+if secc_f.empty:
+    st.error("Con esos filtros no quedó ninguna sección.")
+    st.stop()
+
+# Recorte rápido de manzanas a bbox de secciones filtradas (performance)
+minx, miny, maxx, maxy = secc_f.total_bounds
+mza_f = mza.cx[minx:maxx, miny:maxy].copy()
+if mza_f.empty:
+    st.warning("No quedaron manzanas dentro del bbox de las secciones filtradas (revisa CRS/capa).")
+    st.stop()
+
+st.write(f"Secciones filtradas: **{len(secc_f):,}** | Manzanas (bbox): **{len(mza_f):,}**")
+
+st.divider()
+st.subheader("📊 Conteo manzanas por sección")
+
+pred = st.selectbox("Predicado espacial", ["intersects", "within"], index=0)
+btn = st.button("🚀 Calcular", use_container_width=True)
+
+if not btn:
+    st.stop()
+
+with st.spinner("Cruzando (spatial join) y contando..."):
+    # Trabajamos en CRS proyectado para evitar warnings y mejorar performance
+    secc_wgs = secc_f.copy()
+    mza_wgs = mza_f.copy()
+
+    secc_p = secc_wgs.to_crs(epsg=3857)
+    mza_p = mza_wgs.to_crs(epsg=3857)
+
+    left = mza_p[["geometry"]].copy()
+    right = secc_p[[secc_id_col, "geometry"]].copy()
+
+    joined = gpd.sjoin(left, right, how="inner", predicate=pred)
+
+    counts = (
+        joined.groupby(secc_id_col)
+        .size()
+        .reset_index(name="MANZANAS")
+        .sort_values("MANZANAS", ascending=False)
+    )
+
+    # Merge a secciones (para mapa / tooltip)
+    secc_out = secc_wgs.copy()
+    secc_out[secc_id_col] = secc_out[secc_id_col].astype(str)
+    counts[secc_id_col] = counts[secc_id_col].astype(str)
+
+    secc_out = secc_out.merge(counts, on=secc_id_col, how="left")
+    secc_out["MANZANAS"] = secc_out["MANZANAS"].fillna(0).astype(int)
+
+st.success("Listo ✅")
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Secciones", f"{len(secc_out):,}")
+m2.metric("Manzanas contadas", f"{int(secc_out['MANZANAS'].sum()):,}")
+m3.metric("Promedio por sección", f"{secc_out['MANZANAS'].mean():.2f}")
+
+cT, cM = st.columns([1, 1.3])
+with cT:
+    st.dataframe(counts, use_container_width=True, height=520)
+
     st.download_button(
-        "⬇️ Descargar Excel (manzanas por sección)",
-        data=xls,
-        file_name="manzanas_por_seccion.xlsx",
+        "⬇️ Descargar CSV",
+        data=counts.to_csv(index=False).encode("utf-8"),
+        file_name="conteo_manzanas_por_seccion.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "⬇️ Descargar Excel",
+        data=to_excel_bytes(counts, sheet="MANZANAS_X_SECCION"),
+        file_name="conteo_manzanas_por_seccion.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    # =========================
-    #   MAPA (RELIEVE)
-    # =========================
-    st.subheader("🧭 Mapa (Relieve / Topo)")
-    tooltip_fields = [seccion_id_col, "manzanas_conteo"]
+# =========================
+# MAPA
+# =========================
+with cM:
+    st.subheader("🗺️ Mapa (coloreado por conteo)")
+
+    lat, lon = safe_center(secc_out)
+    m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True)
+
+    # basemaps
+    if basemap == "Relieve (Esri)":
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
+            name="Relieve (Esri)",
+            attr="Tiles © Esri",
+            overlay=False,
+            control=True,
+        ).add_to(m)
+    elif basemap == "Topográfico (OpenTopoMap)":
+        folium.TileLayer(
+            tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+            name="Topográfico (OpenTopoMap)",
+            attr="© OpenTopoMap / © OpenStreetMap contributors",
+            overlay=False,
+            control=True,
+        ).add_to(m)
+    else:
+        folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(m)
+
+    # estilo por rangos
+    def style_fn(feat):
+        v = int(feat["properties"].get("MANZANAS", 0))
+        if v == 0:
+            return {"weight": 1, "fillOpacity": 0.06, "color": "#444"}
+        if v <= 20:
+            return {"weight": 2, "fillOpacity": 0.12, "color": "#1f77b4"}
+        if v <= 50:
+            return {"weight": 2, "fillOpacity": 0.14, "color": "#ff7f0e"}
+        return {"weight": 2, "fillOpacity": 0.16, "color": "#d62728"}
+
+    tooltip_fields = [secc_id_col, "MANZANAS"]
+    aliases = ["Sección:", "Manzanas:"]
+
     if distrito_col != "(no usar)":
         tooltip_fields.append(distrito_col)
-    if municipio_col != "(no usar)":
-        tooltip_fields.append(municipio_col)
+        aliases.append("Distrito:")
+    if mun_col != "(no usar)":
+        tooltip_fields.append(mun_col)
+        aliases.append("Municipio:")
 
-    m = make_relief_map(gdf_out, gdf_manz_f, tooltip_fields=tooltip_fields)
-    st_folium(m, height=650, use_container_width=True)
+    folium.GeoJson(
+        secc_out.to_json(),
+        name="Secciones (INE) + Conteo",
+        style_function=style_fn,
+        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields, aliases=aliases, sticky=False),
+    ).add_to(m)
 
-else:
-    # Mapa preliminar (sin conteos)
-    st.subheader("🧭 Mapa (Relieve / Topo)")
-    m0 = make_relief_map(gdf_secc_f, gdf_manz_f, tooltip_fields=[seccion_id_col])
-    st_folium(m0, height=650, use_container_width=True)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # zoom al bbox de secciones
+    b = secc_out.total_bounds
+    m.fit_bounds([[b[1], b[0]], [b[3], b[2]]])
+
+    st_folium(m, use_container_width=True, height=580)
+
+st.divider()
+st.subheader("🔎 (Opcional) Ver manzanas SOLO de una sección")
+sel_sec = st.selectbox("Elige una sección para dibujar sus manzanas (evita crasheos)", sorted(secc_out[secc_id_col].astype(str).unique().tolist()))
+show_mza = st.checkbox("Dibujar manzanas de esa sección", value=False)
+
+if show_mza:
+    with st.spinner("Recortando manzanas por sección seleccionada..."):
+        # recorte en CRS proyectado por performance
+        sec_poly_wgs = secc_out[secc_out[secc_id_col].astype(str) == str(sel_sec)].copy()
+        if sec_poly_wgs.empty:
+            st.warning("No encontré esa sección.")
+            st.stop()
+
+        sec_poly_p = sec_poly_wgs.to_crs(epsg=3857)
+        mza_p2 = mza_wgs.to_crs(epsg=3857)
+
+        # recorte real
+        clip = gpd.overlay(mza_p2, sec_poly_p[["geometry"]], how="intersection")
+        clip_wgs = clip.to_crs(epsg=4326)
+
+    st.write(f"Manzanas en la sección {sel_sec}: **{len(clip_wgs):,}**")
+
+    lat2, lon2 = safe_center(sec_poly_wgs)
+    m2 = folium.Map(location=[lat2, lon2], zoom_start=14, tiles=None, control_scale=True)
+
+    # basemap replicado
+    if basemap == "Relieve (Esri)":
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
+            name="Relieve (Esri)",
+            attr="Tiles © Esri",
+            overlay=False,
+            control=True,
+        ).add_to(m2)
+    elif basemap == "Topográfico (OpenTopoMap)":
+        folium.TileLayer(
+            tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+            name="Topográfico (OpenTopoMap)",
+            attr="© OpenTopoMap / © OpenStreetMap contributors",
+            overlay=False,
+            control=True,
+        ).add_to(m2)
+    else:
+        folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(m2)
+
+    folium.GeoJson(sec_poly_wgs.to_json(), name="Sección", style_function=lambda f: {"weight": 4, "fillOpacity": 0.05}).add_to(m2)
+    folium.GeoJson(clip_wgs.to_json(), name="Manzanas", style_function=lambda f: {"weight": 1, "fillOpacity": 0.0}).add_to(m2)
+    folium.LayerControl(collapsed=False).add_to(m2)
+
+    b2 = sec_poly_wgs.total_bounds
+    m2.fit_bounds([[b2[1], b2[0]], [b2[3], b2[2]]])
+
+    st_folium(m2, use_container_width=True, height=580)
