@@ -3,6 +3,7 @@
 # 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
 # ✅ Filtro por VARIAS SECCIONES (multiselect)
+# ✅ Secciones con color distinto (por sección) + etiquetas visibles (número de sección)
 # ✅ Exportar a KMZ (KML comprimido) con secciones y (opcional) manzanas
 # ✅ “Imprimir pantalla”: descarga del HTML del mapa (ábrelo en navegador y Ctrl+P / Imprimir)
 #
@@ -182,6 +183,44 @@ def to_excel_bytes(sheets: dict) -> bytes:
 
 
 # -------------------------
+# Color helpers for sections
+# -------------------------
+def _hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
+    """h in [0,360), s,l in [0,1]"""
+    c = (1 - abs(2*l - 1)) * s
+    hp = h / 60.0
+    x = c * (1 - abs((hp % 2) - 1))
+    if 0 <= hp < 1:
+        r1, g1, b1 = c, x, 0
+    elif 1 <= hp < 2:
+        r1, g1, b1 = x, c, 0
+    elif 2 <= hp < 3:
+        r1, g1, b1 = 0, c, x
+    elif 3 <= hp < 4:
+        r1, g1, b1 = 0, x, c
+    elif 4 <= hp < 5:
+        r1, g1, b1 = x, 0, c
+    else:
+        r1, g1, b1 = c, 0, x
+    m = l - c/2
+    r, g, b = r1 + m, g1 + m, b1 + m
+    return int(round(r*255)), int(round(g*255)), int(round(b*255))
+
+
+def color_for_section(section_value) -> str:
+    """Color determinístico por sección (hex)."""
+    try:
+        v = int(section_value)
+    except Exception:
+        v = abs(hash(str(section_value))) % 100000
+    # hue basado en el valor
+    h = (v * 47) % 360
+    # saturación/luz fijas para que se vea bien
+    r, g, b = _hsl_to_rgb(h, 0.65, 0.55)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+# -------------------------
 # KML / KMZ export helpers (sin dependencias)
 # -------------------------
 def xml_escape(s: str) -> str:
@@ -194,7 +233,6 @@ def xml_escape(s: str) -> str:
 
 
 def iter_polygons(geom) -> Iterable:
-    """Devuelve polígonos (Polygon) a partir de Polygon/MultiPolygon."""
     if geom is None:
         return []
     gt = geom.geom_type
@@ -202,7 +240,6 @@ def iter_polygons(geom) -> Iterable:
         return [geom]
     if gt == "MultiPolygon":
         return list(geom.geoms)
-    # si viniera GeometryCollection
     if gt == "GeometryCollection":
         out = []
         for g in geom.geoms:
@@ -212,22 +249,8 @@ def iter_polygons(geom) -> Iterable:
 
 
 def ring_to_kml_coords(ring) -> str:
-    # ring: LinearRing
     coords = list(ring.coords)
-    # KML wants lon,lat,alt
     return " ".join([f"{x:.8f},{y:.8f},0" for x, y in coords])
-
-
-def geom_to_kml(geom) -> str:
-    """Convierte (Multi)Polygon a KML Polygon(s)."""
-    polys = iter_polygons(geom)
-    if not polys:
-        return ""
-    if len(polys) == 1:
-        return polygon_to_kml(polys[0])
-    # MultiGeometry
-    parts = "\n".join([polygon_to_kml(p) for p in polys])
-    return f"<MultiGeometry>\n{parts}\n</MultiGeometry>"
 
 
 def polygon_to_kml(poly) -> str:
@@ -251,6 +274,28 @@ def polygon_to_kml(poly) -> str:
     </Polygon>"""
 
 
+def geom_to_kml(geom) -> str:
+    polys = []
+    if geom is None:
+        return ""
+    if geom.geom_type == "Polygon":
+        polys = [geom]
+    elif geom.geom_type == "MultiPolygon":
+        polys = list(geom.geoms)
+    elif geom.geom_type == "GeometryCollection":
+        for g in geom.geoms:
+            if g.geom_type == "Polygon":
+                polys.append(g)
+            elif g.geom_type == "MultiPolygon":
+                polys.extend(list(g.geoms))
+    if not polys:
+        return ""
+    if len(polys) == 1:
+        return polygon_to_kml(polys[0])
+    parts = "\n".join([polygon_to_kml(p) for p in polys])
+    return f"<MultiGeometry>\n{parts}\n</MultiGeometry>"
+
+
 def gdf_to_kml_folder(gdf: gpd.GeoDataFrame, folder_name: str, name_col: Optional[str], max_features: int) -> str:
     gdf2 = gdf.copy()
     if len(gdf2) > max_features:
@@ -259,8 +304,7 @@ def gdf_to_kml_folder(gdf: gpd.GeoDataFrame, folder_name: str, name_col: Optiona
     placemarks = []
     cols = [c for c in gdf2.columns if c != "geometry"]
     for _, row in gdf2.iterrows():
-        geom = row.geometry
-        kml_geom = geom_to_kml(geom)
+        kml_geom = geom_to_kml(row.geometry)
         if not kml_geom:
             continue
 
@@ -268,10 +312,8 @@ def gdf_to_kml_folder(gdf: gpd.GeoDataFrame, folder_name: str, name_col: Optiona
         if name_col and name_col in gdf2.columns:
             nm = str(row.get(name_col))
         else:
-            # intenta con SECCION si existe
             nm = str(row.get("SECCION") or row.get("SECC") or "")
 
-        # ExtendedData
         data_items = []
         for c in cols:
             v = row.get(c)
@@ -507,7 +549,14 @@ tab_map, tab_tables, tab_export = st.tabs(["🗺️ Mapa", "📋 Tablas", "⬇�
 # -------------------------
 with tab_map:
     st.subheader("Mapa")
-    show_manz = st.checkbox("Mostrar manzanas (puede ser pesado)", value=False)
+
+    cA, cB, cC = st.columns([1, 1, 2])
+    with cA:
+        show_manz = st.checkbox("Mostrar manzanas", value=False)
+    with cB:
+        show_labels = st.checkbox("Mostrar número de sección (etiqueta)", value=True)
+    with cC:
+        label_size = st.slider("Tamaño etiqueta", min_value=10, max_value=26, value=16, step=1)
 
     lat, lon = safe_center(secc_f)
     m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True)
@@ -548,33 +597,76 @@ with tab_map:
             fields.append(c)
             aliases.append(a)
 
+    # Style per feature: unique color per section (if column exists)
+    sec_col = col_sec if col_sec and col_sec in secc_f.columns else None
+
+    def style_fn(feat):
+        props = feat.get("properties", {})
+        sec_val = props.get(sec_col) if sec_col else None
+        fc = color_for_section(sec_val if sec_val is not None else props.get("id", 0))
+        return {
+            "color": "#000000",      # bordes negros para separación
+            "weight": 2,
+            "fillColor": fc,
+            "fillOpacity": 0.35,
+        }
+
     folium.GeoJson(
         secc_f.to_json(),
         name="Secciones",
-        style_function=lambda feat: {"weight": 2, "fillOpacity": 0.06},
+        style_function=style_fn,
         tooltip=folium.GeoJsonTooltip(fields=fields, aliases=aliases, sticky=False) if fields else None,
     ).add_to(m)
 
+    # Etiquetas visibles (número de sección)
+    if show_labels and sec_col:
+        # representative_point() cae dentro del polígono (mejor que centroid)
+        for _, row in secc_f.iterrows():
+            try:
+                sec_val = int(row.get(sec_col))
+            except Exception:
+                sec_val = row.get(sec_col)
+
+            pt = row.geometry.representative_point()
+            folium.Marker(
+                location=[pt.y, pt.x],
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style="
+                        font-size:{label_size}px;
+                        font-weight:700;
+                        color:#111;
+                        background:rgba(255,255,255,0.70);
+                        border:1px solid rgba(0,0,0,0.35);
+                        border-radius:6px;
+                        padding:1px 6px;
+                        line-height:1.1;
+                        white-space:nowrap;
+                        ">
+                        {sec_val}
+                    </div>
+                    """
+                )
+            ).add_to(m)
+
     if show_manz:
-        # muestreo para no matar el mapa
         max_feat = 6000
         mz_show = mza_bbox.sample(max_feat, random_state=7).copy() if len(mza_bbox) > max_feat else mza_bbox
         folium.GeoJson(
             mz_show.to_json(),
             name="Manzanas",
-            style_function=lambda feat: {"weight": 1, "fillOpacity": 0.02},
+            style_function=lambda feat: {"weight": 1, "fillOpacity": 0.04},
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     bds = secc_f.total_bounds
     m.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
 
-    # guardar HTML del mapa para export/impresión
     st.session_state["LAST_MAP_HTML"] = m.get_root().render()
 
     st_folium(m, use_container_width=True, height=650)
 
-    st.info("🖨️ Para imprimir: ve a la pestaña **Exportar** y descarga el **HTML del mapa**. Ábrelo en tu navegador y usa **Ctrl+P / Imprimir**.")
+    st.info("🖨️ Para imprimir: ve a **Exportar** y descarga el **HTML del mapa**. Ábrelo en tu navegador y usa **Ctrl+P / Imprimir**.")
 
 # -------------------------
 # TABLES
@@ -648,15 +740,13 @@ with tab_export:
     st.subheader("🗺️ Exportar KMZ (Google Earth)")
 
     include_manz = st.checkbox("Incluir manzanas en el KMZ (puede pesar)", value=False)
-    max_mz = st.slider("Límite máximo de manzanas en KMZ", min_value=500, max_value=20000, value=6000, step=500, help="Si hay muchas manzanas, limita para que el KMZ no se haga enorme.")
-    name_col_secc = col_sec if col_sec else None
-    name_col_mza = mza_sec if mza_sec else None
+    max_mz = st.slider("Límite máximo de manzanas en KMZ", min_value=500, max_value=20000, value=6000, step=500)
 
-    # construir kmz bytes (solo cuando piden descargar)
     if st.button("Preparar KMZ", use_container_width=True):
         with st.spinner("Generando KMZ..."):
-            # secc_f y mza_bbox ya están en EPSG:4326
             mza_for_kmz = mza_bbox if include_manz else None
+            name_col_secc = col_sec if col_sec else None
+            name_col_mza = mza_sec if mza_sec else None
             kml = build_kml_document(secc_f, mza_for_kmz, name_col_secc, name_col_mza, max_manzanas=max_mz)
             kmz_bytes = kml_to_kmz_bytes(kml, "doc.kml")
             st.session_state["LAST_KMZ"] = kmz_bytes
@@ -688,4 +778,4 @@ with tab_export:
         )
         st.caption("Abre el HTML en tu navegador y usa **Ctrl+P / Imprimir** (o “Guardar como PDF”).")
 
-st.success("✅ Listo. Ya tienes multi-secciones + KMZ + HTML imprimible.")
+st.success("✅ Listo. Secciones a color + etiquetas visibles + multi-secciones + KMZ + HTML imprimible.")
