@@ -1,13 +1,15 @@
-# app_mapas_sinaloa.py
-# 🗺️ App de Mapas — Sinaloa (Secciones INE + Manzanas INEGI) + Conteo + (Opcional) Población por Sección
+
+# app_mapa_1zip.py
+# 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
-# - Carga 2 ZIP: (1) INE BGD (o zip mínimo con SECCION.*), (2) INEGI Marco (o zip mínimo con 25m.*)
-# - Mapa base: Relieve / Topo / Calles / Satélite
-# - Explora secciones, filtra por municipio/distrito si existen columnas
-# - Cuenta manzanas por sección (sjoin) y exporta CSV/Excel
-# - Población por sección (opcional): sube CSV/Excel con columnas (SECCION, POBTOT) o similares y se une
+# - Sube SOLO 1 ZIP que contenga ambos SHP:
+#     * Secciones (INE): ...SECCION*.shp o ...SECCIONES*.shp
+#     * Manzanas (INEGI): ...MANZANAS*.shp o ...25m.shp
+# - Filtros: Distrito local/federal, Municipio y Sección
+# - Mapa base: relieve/topo/calles/satélite
+# - Tablas + export CSV/Excel
 #
-# Requisitos: ver requirements.txt (geopandas>=0.14, shapely>=2, pyogrio recomendado)
+# Nota: para que funcione sin broncas, el ZIP debe traer .shp + .dbf + .shx + .prj (y opcional .cpg)
 
 from __future__ import annotations
 
@@ -21,8 +23,8 @@ from typing import List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
-import geopandas as gpd
 
+import geopandas as gpd
 import folium
 from streamlit_folium import st_folium
 
@@ -30,13 +32,13 @@ from streamlit_folium import st_folium
 # -------------------------
 # UI
 # -------------------------
-st.set_page_config(page_title="Mapas Sinaloa — INE/INEGI", page_icon="🗺️", layout="wide")
-st.title("🗺️ Mapas Sinaloa — Secciones (INE) + Manzanas (INEGI)")
-st.caption("Explora capas, mapa en relieve/topo/satélite y cuenta manzanas por sección. (Población por sección: opcional con tabla).")
+st.set_page_config(page_title="ICC — 1 ZIP Mapas", page_icon="🗺️", layout="wide")
+st.title("🗺️ ICC — Mapas con 1 ZIP (Secciones + Manzanas)")
+st.caption("Sube un ZIP que ya contenga Secciones (INE) y Manzanas (INEGI). Filtra por distrito y sección.")
 
 
 # -------------------------
-# Utils
+# ZIP / workspace helpers
 # -------------------------
 def md5_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
@@ -68,8 +70,7 @@ def extract_nested_zips(base_dir: str, max_depth: int = 2) -> None:
             return
         for z in nested:
             out = z + "_unzipped"
-            if not os.path.exists(out):
-                os.makedirs(out, exist_ok=True)
+            os.makedirs(out, exist_ok=True)
             try:
                 with zipfile.ZipFile(z, "r") as zz:
                     zz.extractall(out)
@@ -86,7 +87,7 @@ def list_shps(ws_dir: str) -> List[str]:
     return sorted(shps)
 
 
-def prepare_workspace(zip_bytes: bytes, key: str) -> Tuple[str, List[str]]:
+def prepare_workspace(zip_bytes: bytes, key: str = "ONEZIP") -> Tuple[str, List[str]]:
     h = md5_bytes(zip_bytes)
     ss_key = f"WS_{key}"
     if ss_key in st.session_state:
@@ -98,36 +99,16 @@ def prepare_workspace(zip_bytes: bytes, key: str) -> Tuple[str, List[str]]:
     safe_extract_zip_bytes(zip_bytes, ws)
     extract_nested_zips(ws, max_depth=2)
     shps = list_shps(ws)
+
     st.session_state[ss_key] = {"hash": h, "dir": ws, "shps": shps}
     return ws, shps
 
 
-def filter_list(items: List[str], q: str) -> List[str]:
-    q = (q or "").strip().lower()
-    if not q:
-        return items
-    return [x for x in items if q in x.lower()]
-
-
-def auto_pick(shps: List[str], kind: str) -> int:
-    low = [s.lower() for s in shps]
-    if kind == "seccion":
-        for i, s in enumerate(low):
-            if "seccion" in s or "secc" in s:
-                return i
-        return 0
-    if kind == "manzana":
-        for i, s in enumerate(low):
-            if re.search(r"(^|/)\d{2}m\.shp$", s):
-                return i
-        for i, s in enumerate(low):
-            if "manzana" in s or "manz" in s or "mza" in s:
-                return i
-        return 0
-    return 0
-
-
+# -------------------------
+# Geo helpers
+# -------------------------
 def ensure_active_geometry(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Normaliza geometry activa a 'geometry'."""
     try:
         _ = gdf.geometry
     except Exception:
@@ -141,7 +122,6 @@ def ensure_active_geometry(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         if "geometry" in gdf.columns and str(gdf["geometry"].dtype) != "geometry":
             gdf = gdf.rename(columns={"geometry": "GEOMETRY_OLD"})
         gdf = gdf.rename(columns={geom_name: "geometry"}).set_geometry("geometry")
-
     return gdf
 
 
@@ -167,7 +147,6 @@ def read_layer(ws_dir: str, shp_rel: str, label: str) -> gpd.GeoDataFrame:
     if gdf.crs is None:
         st.warning(f"⚠️ {label} sin CRS. Asumiendo EPSG:4326.")
         gdf = gdf.set_crs(epsg=4326, allow_override=True)
-
     try:
         gdf = gdf.to_crs(epsg=4326)
     except Exception:
@@ -175,6 +154,11 @@ def read_layer(ws_dir: str, shp_rel: str, label: str) -> gpd.GeoDataFrame:
 
     gdf = gdf[gdf.geometry.notna()].copy()
     return gdf
+
+
+def safe_center(gdf: gpd.GeoDataFrame) -> Tuple[float, float]:
+    minx, miny, maxx, maxy = gdf.total_bounds
+    return ((miny + maxy) / 2.0, (minx + maxx) / 2.0)
 
 
 def pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
@@ -185,128 +169,198 @@ def pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
     return None
 
 
-def safe_center(gdf: gpd.GeoDataFrame) -> Tuple[float, float]:
-    minx, miny, maxx, maxy = gdf.total_bounds
-    return ((miny + maxy) / 2.0, (minx + maxx) / 2.0)
-
-
-def to_excel_bytes(df: pd.DataFrame, sheet: str) -> bytes:
+def to_excel_bytes(sheets: dict) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
+        for name, df in sheets.items():
+            df.to_excel(w, index=False, sheet_name=name[:31])
     return out.getvalue()
 
 
-def to_geojson_small(gdf: gpd.GeoDataFrame, max_features: int = 6000) -> str:
-    if len(gdf) > max_features:
-        gdf = gdf.sample(max_features, random_state=7).copy()
-    return gdf.to_json()
+# -------------------------
+# Auto-detect SHPs
+# -------------------------
+def auto_pick_secciones(shps: List[str]) -> Optional[str]:
+    low = [s.lower() for s in shps]
+    # prefer explicit "secciones_distrito"
+    for i, s in enumerate(low):
+        if "secciones" in s and s.endswith(".shp"):
+            return shps[i]
+    for i, s in enumerate(low):
+        if "seccion" in s and s.endswith(".shp"):
+            return shps[i]
+    return None
+
+
+def auto_pick_manzanas(shps: List[str]) -> Optional[str]:
+    low = [s.lower() for s in shps]
+    for i, s in enumerate(low):
+        if "manzanas" in s and s.endswith(".shp"):
+            return shps[i]
+    for i, s in enumerate(low):
+        if re.search(r"(^|/)\d{2}m\.shp$", s):
+            return shps[i]
+    for i, s in enumerate(low):
+        if "mza" in s and s.endswith(".shp"):
+            return shps[i]
+    return None
 
 
 # -------------------------
-# Inputs
+# Input: 1 ZIP
 # -------------------------
-st.subheader("1) Carga de ZIPs")
-c1, c2, c3 = st.columns([1, 1, 1])
+zip_file = st.file_uploader("📦 Sube tu ZIP (Secciones + Manzanas)", type=["zip"])
+basemap = st.selectbox("Mapa base", ["Relieve (Esri)", "Topográfico (OpenTopoMap)", "Calles (OSM)", "Satélite (Esri)"], index=0)
 
+if not zip_file:
+    st.info("Sube el ZIP para empezar.")
+    st.stop()
+
+zbytes = zip_file.getvalue()
+
+with st.spinner("Preparando ZIP..."):
+    ws, shps = prepare_workspace(zbytes, "ONEZIP")
+
+if not shps:
+    st.error("No encontré ningún .shp dentro del ZIP.")
+    st.stop()
+
+# selección automática + manual
+secc_guess = auto_pick_secciones(shps)
+mza_guess = auto_pick_manzanas(shps)
+
+st.subheader("🧩 Capas detectadas")
+c1, c2 = st.columns(2)
 with c1:
-    zip_ine = st.file_uploader("ZIP 1 — INE BGD (o ZIP mínimo con SECCION.*)", type=["zip"])
+    secc_shp = st.selectbox("Capa de SECCIONES (INE)", shps, index=shps.index(secc_guess) if secc_guess in shps else 0)
 with c2:
-    zip_inegi = st.file_uploader("ZIP 2 — INEGI Marco (o ZIP mínimo con 25m.*)", type=["zip"])
-with c3:
-    basemap = st.selectbox("Mapa base", ["Relieve (Esri)", "Topográfico (OpenTopoMap)", "Calles (OSM)", "Satélite (Esri)"], index=0)
+    mza_shp = st.selectbox("Capa de MANZANAS (INEGI)", shps, index=shps.index(mza_guess) if mza_guess in shps else min(1, len(shps)-1))
 
-if not zip_ine or not zip_inegi:
-    st.info("Sube los dos ZIP para continuar.")
-    st.stop()
+with st.expander("🧪 Debug: lista de SHP encontrados", expanded=False):
+    st.write(shps)
 
-ine_bytes = zip_ine.getvalue()
-inegi_bytes = zip_inegi.getvalue()
+with st.spinner("Leyendo capas..."):
+    secc = read_layer(ws, secc_shp, "Secciones")
+    mza = read_layer(ws, mza_shp, "Manzanas")
 
-with st.spinner("📦 Preparando INE..."):
-    ws_ine, shps_ine = prepare_workspace(ine_bytes, "INE")
-with st.spinner("📦 Preparando INEGI..."):
-    ws_inegi, shps_inegi = prepare_workspace(inegi_bytes, "INEGI")
+# -------------------------
+# Columnas esperadas
+# -------------------------
+# Para secciones INE: ENTIDAD, MUNICIPIO, DISTRITO_L, DISTRITO_F, SECCION, etc.
+col_ent = pick_col(list(secc.columns), ["ENTIDAD", "CVE_ENT", "ENT"])
+col_mun = pick_col(list(secc.columns), ["MUNICIPIO", "CVE_MUN", "MUN"])
+col_dl  = pick_col(list(secc.columns), ["DISTRITO_L", "DISTRITO", "DTO_L", "DIST_L"])
+col_df  = pick_col(list(secc.columns), ["DISTRITO_F", "DTO_F", "DIST_F"])
+col_sec = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC"])
+col_manz = pick_col(list(secc.columns), ["MANZANAS"])
+col_vot = pick_col(list(secc.columns), ["VOTANTES", "VOT_EST"])
+col_p18 = pick_col(list(secc.columns), ["POB18MAS", "POB_18_MAS", "P18MAS"])
 
-if not shps_ine:
-    st.error("No encontré .shp en el ZIP del INE.")
-    st.stop()
-if not shps_inegi:
-    st.error("No encontré .shp en el ZIP del INEGI.")
-    st.stop()
+# Manzanas: SECCION y POB18MAS opcionales
+mza_sec = pick_col(list(mza.columns), ["SECCION"])
+mza_p18 = pick_col(list(mza.columns), ["POB18MAS", "POB_18_MAS", "P18MAS"])
 
-st.subheader("2) Selección de capas (SHP)")
-f1, f2 = st.columns(2)
+# -------------------------
+# Filtros
+# -------------------------
+st.divider()
+st.subheader("🎛️ Filtros (Distrito / Sección)")
+
+secc_f = secc.copy()
+
+f1, f2, f3, f4 = st.columns([1, 1, 1, 1])
+
 with f1:
-    q_ine = st.text_input("Filtrar capas INE", value="seccion")
+    if col_dl:
+        vals = sorted(secc_f[col_dl].dropna().astype(int).unique().tolist())
+        dl_sel = st.selectbox("Distrito Local", ["(todos)"] + vals, index=0)
+        if dl_sel != "(todos)":
+            secc_f = secc_f[secc_f[col_dl].astype(int) == int(dl_sel)].copy()
+    else:
+        st.write("Distrito Local: (no detectado)")
+
 with f2:
-    q_inegi = st.text_input("Filtrar capas INEGI", value="25m")
+    if col_df:
+        vals = sorted(secc_f[col_df].dropna().astype(int).unique().tolist())
+        df_sel = st.selectbox("Distrito Federal", ["(todos)"] + vals, index=0)
+        if df_sel != "(todos)":
+            secc_f = secc_f[secc_f[col_df].astype(int) == int(df_sel)].copy()
+    else:
+        st.write("Distrito Federal: (no detectado)")
 
-ine_view = filter_list(shps_ine, q_ine) or shps_ine
-inegi_view = filter_list(shps_inegi, q_inegi) or shps_inegi
-
-idx_secc = auto_pick(ine_view, "seccion")
-idx_mza = auto_pick(inegi_view, "manzana")
-
-a, b = st.columns(2)
-with a:
-    shp_secc = st.selectbox("INE: Secciones", ine_view, index=min(idx_secc, len(ine_view)-1))
-with b:
-    shp_mza = st.selectbox("INEGI: Manzanas", inegi_view, index=min(idx_mza, len(inegi_view)-1))
-
-if re.search(r"(^|/)\d{2}a\.shp$", shp_mza.lower()):
-    st.warning("⚠️ Elegiste ..a.shp (AGEB). Para manzana busca ..m.shp (ej: 25m.shp).")
-
-with st.spinner("🧠 Leyendo capas seleccionadas..."):
-    secc = read_layer(ws_ine, shp_secc, "INE Secciones")
-    mza = read_layer(ws_inegi, shp_mza, "INEGI Manzanas")
-
-st.success(f"Secciones: {len(secc):,} | Manzanas: {len(mza):,}")
-
-tab1, tab2, tab3 = st.tabs(["🗺️ Mapa", "📊 Conteo manzanas x sección", "👥 Población por sección (opcional)"])
-
-
-# -------------------------
-# TAB 1
-# -------------------------
-with tab1:
-    st.subheader("Mapa interactivo")
-
-    guess_secc = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC"])
-    secc_id_col = st.selectbox("Columna ID de Sección", sorted(secc.columns),
-                               index=sorted(secc.columns).index(guess_secc) if guess_secc in secc.columns else 0)
-
-    distrito_col = pick_col(list(secc.columns), ["DISTRITO", "DTO", "DIST", "CVE_DIST"])
-    mun_col = pick_col(list(secc.columns), ["MUNICIPIO", "NOM_MUN", "NOM_MPIO", "CVE_MUN", "MUN"])
-
-    cfa, cfb, cfc = st.columns(3)
-    with cfa:
-        use_mun = st.checkbox("Filtrar por municipio (si existe)", value=bool(mun_col))
-    with cfb:
-        use_dist = st.checkbox("Filtrar por distrito (si existe)", value=bool(distrito_col))
-    with cfc:
-        show_manzanas = st.checkbox("Mostrar manzanas (recortadas) en el mapa", value=False)
-
-    secc_f = secc.copy()
-
-    if use_mun and mun_col:
-        vals = sorted(secc_f[mun_col].dropna().astype(str).unique().tolist())
+with f3:
+    if col_mun:
+        vals = sorted(secc_f[col_mun].dropna().astype(int).unique().tolist())
         mun_sel = st.selectbox("Municipio", ["(todos)"] + vals, index=0)
         if mun_sel != "(todos)":
-            secc_f = secc_f[secc_f[mun_col].astype(str) == str(mun_sel)].copy()
+            secc_f = secc_f[secc_f[col_mun].astype(int) == int(mun_sel)].copy()
+    else:
+        st.write("Municipio: (no detectado)")
 
-    if use_dist and distrito_col:
-        vals = sorted(secc_f[distrito_col].dropna().astype(str).unique().tolist())
-        dist_sel = st.selectbox("Distrito", ["(todos)"] + vals, index=0)
-        if dist_sel != "(todos)":
-            secc_f = secc_f[secc_f[distrito_col].astype(str) == str(dist_sel)].copy()
+with f4:
+    if col_sec:
+        # No saturar: si hay muchas, permitir buscar
+        secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
+        sec_sel = st.selectbox("Sección", ["(todas)"] + secs, index=0)
+        if sec_sel != "(todas)":
+            secc_f = secc_f[secc_f[col_sec].astype(int) == int(sec_sel)].copy()
+    else:
+        st.write("Sección: (no detectada)")
 
-    if secc_f.empty:
-        st.error("Con esos filtros no quedó ninguna sección.")
-        st.stop()
+if secc_f.empty:
+    st.error("Con esos filtros no quedó ninguna sección.")
+    st.stop()
+
+# recorte manzanas por bbox de secciones filtradas
+minx, miny, maxx, maxy = secc_f.total_bounds
+mza_bbox = mza.cx[minx:maxx, miny:maxy].copy()
+
+# si manzanas tiene SECCION, filtrar más fino si hay selección de sección
+if mza_sec and col_sec and ("sec_sel" in locals()) and sec_sel != "(todas)":
+    try:
+        mza_bbox = mza_bbox[mza_bbox[mza_sec].astype(int) == int(sec_sel)].copy()
+    except Exception:
+        pass
+
+# -------------------------
+# KPIs / info general
+# -------------------------
+st.divider()
+st.subheader("📌 Información general del recorte")
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Secciones", f"{len(secc_f):,}")
+k2.metric("Manzanas (bbox)", f"{len(mza_bbox):,}")
+
+if col_manz:
+    k3.metric("Manzanas (sum en secciones)", f"{int(secc_f[col_manz].fillna(0).sum()):,}")
+else:
+    k3.metric("Manzanas (sum secciones)", "N/D")
+
+if col_vot:
+    try:
+        k4.metric("Votantes (col)", f"{int(pd.to_numeric(secc_f[col_vot], errors='coerce').fillna(0).sum()):,}")
+    except Exception:
+        k4.metric("Votantes (col)", "N/D")
+elif col_p18:
+    k4.metric("POB 18+ (col)", f"{int(pd.to_numeric(secc_f[col_p18], errors='coerce').fillna(0).sum()):,}")
+else:
+    k4.metric("Votantes/POB", "N/D")
+
+# -------------------------
+# Tabs
+# -------------------------
+tab_map, tab_tables, tab_export = st.tabs(["🗺️ Mapa", "📋 Tablas", "⬇️ Exportar"])
+
+# -------------------------
+# MAP
+# -------------------------
+with tab_map:
+    st.subheader("Mapa")
+    show_manz = st.checkbox("Mostrar manzanas (puede ser pesado)", value=False)
 
     lat, lon = safe_center(secc_f)
-    m = folium.Map(location=[lat, lon], zoom_start=8, tiles=None, control_scale=True)
+    m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None, control_scale=True)
 
     if basemap == "Relieve (Esri)":
         folium.TileLayer(
@@ -328,257 +382,112 @@ with tab1:
     else:
         folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(m)
 
-    tooltip_fields = [secc_id_col]
-    aliases = ["Sección:"]
-    if mun_col:
-        tooltip_fields.append(mun_col); aliases.append("Municipio:")
-    if distrito_col:
-        tooltip_fields.append(distrito_col); aliases.append("Distrito:")
+    # Tooltip fields
+    fields = []
+    aliases = []
+    for c, a in [(col_sec, "Sección:"), (col_dl, "DL:"), (col_df, "DF:"), (col_mun, "Mpio:"), (col_manz, "Manzanas:"), (col_vot, "Votantes:"), (col_p18, "POB18+:")]:
+        if c and c in secc_f.columns:
+            fields.append(c)
+            aliases.append(a)
 
     folium.GeoJson(
         secc_f.to_json(),
         name="Secciones",
-        style_function=lambda feat: {"weight": 1.6, "fillOpacity": 0.06},
-        tooltip=folium.GeoJsonTooltip(fields=tooltip_fields, aliases=aliases, sticky=False),
+        style_function=lambda feat: {"weight": 2, "fillOpacity": 0.06},
+        tooltip=folium.GeoJsonTooltip(fields=fields, aliases=aliases, sticky=False) if fields else None,
     ).add_to(m)
 
-    if show_manzanas:
-        minx, miny, maxx, maxy = secc_f.total_bounds
-        mza_f = mza.cx[minx:maxx, miny:maxy].copy()
-        gj = to_geojson_small(mza_f, max_features=6000)
+    if show_manz:
+        # muestreo para no matar el mapa
+        max_feat = 6000
+        mz_show = mza_bbox.sample(max_feat, random_state=7).copy() if len(mza_bbox) > max_feat else mza_bbox
         folium.GeoJson(
-            gj,
-            name="Manzanas (muestra)",
-            style_function=lambda feat: {"weight": 0.8, "fillOpacity": 0.02},
+            mz_show.to_json(),
+            name="Manzanas",
+            style_function=lambda feat: {"weight": 1, "fillOpacity": 0.02},
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
+
     bds = secc_f.total_bounds
     m.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
 
     st_folium(m, use_container_width=True, height=650)
 
-
 # -------------------------
-# TAB 2
+# TABLES
 # -------------------------
-with tab2:
-    st.subheader("Conteo de manzanas por sección")
-
-    guess_secc = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC"])
-    secc_id_col = st.selectbox("Columna ID de Sección (para conteo)", sorted(secc.columns),
-                               index=sorted(secc.columns).index(guess_secc) if guess_secc in secc.columns else 0,
-                               key="secc_id_for_count")
-
-    pred = st.selectbox("Regla espacial", ["intersects", "within"], index=0)
-    approx = st.checkbox("Modo rápido (centroid within) — más rápido, menos exacto en límites", value=True)
-
-    if "COUNT_RESULT" not in st.session_state:
-        st.session_state["COUNT_RESULT"] = None
-
-    colA, colB = st.columns(2)
-    if colA.button("🚀 Calcular (Sinaloa completo)", use_container_width=True):
-        with st.spinner("Procesando (puede tardar)..."):
-            secc_p = ensure_active_geometry(secc).to_crs(epsg=3857)
-            mza_p = ensure_active_geometry(mza).to_crs(epsg=3857)
-
-            if approx:
-                pts = mza_p.copy()
-                pts["geometry"] = pts.geometry.centroid
-                left = gpd.GeoDataFrame(pts[["geometry"]].copy(), geometry="geometry", crs=pts.crs)
-            else:
-                left = gpd.GeoDataFrame(mza_p[["geometry"]].copy(), geometry="geometry", crs=mza_p.crs)
-
-            right = gpd.GeoDataFrame(secc_p[[secc_id_col, "geometry"]].copy(), geometry="geometry", crs=secc_p.crs)
-
-            if left.crs != right.crs:
-                right = right.to_crs(left.crs)
-
-            joined = gpd.sjoin(left, right, how="inner", predicate=pred)
-
-            counts = (
-                joined.groupby(secc_id_col)
-                .size()
-                .reset_index(name="MANZANAS")
-                .sort_values("MANZANAS", ascending=False)
-            )
-
-            secc_out = ensure_active_geometry(secc).copy()
-            secc_out[secc_id_col] = secc_out[secc_id_col].astype(str)
-            counts[secc_id_col] = counts[secc_id_col].astype(str)
-            secc_out = secc_out.merge(counts, on=secc_id_col, how="left")
-            secc_out["MANZANAS"] = secc_out["MANZANAS"].fillna(0).astype(int)
-
-            st.session_state["COUNT_RESULT"] = {"counts": counts, "secc_out": secc_out}
-
-    if colB.button("🧹 Limpiar resultado", use_container_width=True):
-        st.session_state["COUNT_RESULT"] = None
-
-    res = st.session_state["COUNT_RESULT"]
-    if res is None:
-        st.info("Dale a **Calcular** para obtener el conteo y exportarlo.")
-    else:
-        counts = res["counts"]
-        secc_out = res["secc_out"]
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Secciones", f"{len(secc_out):,}")
-        m2.metric("Manzanas contadas", f"{int(secc_out['MANZANAS'].sum()):,}")
-        m3.metric("Promedio por sección", f"{secc_out['MANZANAS'].mean():.2f}")
-
-        st.dataframe(counts, use_container_width=True, height=420)
-
-        cdl1, cdl2 = st.columns(2)
-        cdl1.download_button("⬇️ CSV", counts.to_csv(index=False).encode("utf-8"),
-                             "conteo_manzanas_por_seccion.csv", "text/csv", use_container_width=True)
-        cdl2.download_button("⬇️ Excel", to_excel_bytes(counts, "MANZANAS_X_SECCION"),
-                             "conteo_manzanas_por_seccion.xlsx",
-                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             use_container_width=True)
-
-        st.subheader("Mapa por conteo (secciones)")
-        lat, lon = safe_center(secc_out)
-        mm = folium.Map(location=[lat, lon], zoom_start=8, tiles=None, control_scale=True)
-
-        if basemap == "Relieve (Esri)":
-            folium.TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
-                name="Relieve (Esri)", attr="Tiles © Esri", overlay=False, control=True
-            ).add_to(mm)
-        elif basemap == "Topográfico (OpenTopoMap)":
-            folium.TileLayer(
-                tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-                name="Topográfico (OpenTopoMap)",
-                attr="© OpenTopoMap / © OpenStreetMap contributors",
-                overlay=False, control=True
-            ).add_to(mm)
-        elif basemap == "Satélite (Esri)":
-            folium.TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                name="Satélite (Esri)", attr="Tiles © Esri", overlay=False, control=True
-            ).add_to(mm)
-        else:
-            folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(mm)
-
-        def style_fn(feat):
-            v = int(feat["properties"].get("MANZANAS", 0))
-            if v == 0:
-                return {"weight": 1, "fillOpacity": 0.03}
-            if v <= 20:
-                return {"weight": 1.6, "fillOpacity": 0.08}
-            if v <= 50:
-                return {"weight": 1.6, "fillOpacity": 0.10}
-            return {"weight": 1.6, "fillOpacity": 0.12}
-
-        folium.GeoJson(
-            secc_out.to_json(),
-            name="Secciones (conteo)",
-            style_function=style_fn,
-            tooltip=folium.GeoJsonTooltip(fields=[secc_id_col, "MANZANAS"], aliases=["Sección:", "Manzanas:"], sticky=False),
-        ).add_to(mm)
-
-        folium.LayerControl(collapsed=False).add_to(mm)
-        bds = secc_out.total_bounds
-        mm.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
-
-        st_folium(mm, use_container_width=True, height=650)
-
-
-# -------------------------
-# TAB 3
-# -------------------------
-with tab3:
-    st.subheader("Población / Habitantes por Sección (opcional)")
-    st.info(
-        "Los ZIP de cartografía normalmente NO traen población. "
-        "Para 'habitantes por sección' sube una tabla (CSV/Excel) con: "
-        "columna de sección + columna de población (ej. POBTOT)."
-    )
-
-    pop_file = st.file_uploader("Sube CSV/Excel con población por sección", type=["csv", "xlsx", "xls"])
-    if not pop_file:
-        st.stop()
-
-    if pop_file.name.lower().endswith(".csv"):
-        pop_df = pd.read_csv(pop_file)
-    else:
-        pop_df = pd.read_excel(pop_file)
-
-    pop_df.columns = [str(c).strip().upper() for c in pop_df.columns]
-
-    guess_secc = pick_col(list(secc.columns), ["SECCION", "SECC", "CVE_SECC", "ID_SECC"])
-    secc_id_col = st.selectbox("Columna de sección en el SHP", sorted(secc.columns),
-                               index=sorted(secc.columns).index(guess_secc) if guess_secc in secc.columns else 0,
-                               key="pop_secc_id")
-
-    secc_col_in_table = st.selectbox("Columna de sección en tu tabla", sorted(pop_df.columns))
-    pop_col_in_table = st.selectbox("Columna de población/habitantes en tu tabla", sorted(pop_df.columns))
-
-    secc2 = ensure_active_geometry(secc).copy()
-    secc2[secc_id_col] = secc2[secc_id_col].astype(str)
-
-    pop2 = pop_df.copy()
-    pop2[secc_col_in_table] = pop2[secc_col_in_table].astype(str)
-
-    merged = secc2.merge(
-        pop2[[secc_col_in_table, pop_col_in_table]].drop_duplicates(),
-        left_on=secc_id_col,
-        right_on=secc_col_in_table,
-        how="left",
-    )
-    merged = merged.drop(columns=[secc_col_in_table], errors="ignore")
-    merged[pop_col_in_table] = pd.to_numeric(merged[pop_col_in_table], errors="coerce")
-
-    st.success("Unión lista ✅")
-    st.dataframe(merged[[secc_id_col, pop_col_in_table]].head(50), use_container_width=True)
-
-    st.subheader("Mapa (por población)")
-    lat, lon = safe_center(merged)
-    mp = folium.Map(location=[lat, lon], zoom_start=8, tiles=None, control_scale=True)
-
-    if basemap == "Relieve (Esri)":
-        folium.TileLayer(
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}",
-            name="Relieve (Esri)", attr="Tiles © Esri", overlay=False, control=True
-        ).add_to(mp)
-    elif basemap == "Topográfico (OpenTopoMap)":
-        folium.TileLayer(
-            tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-            name="Topográfico (OpenTopoMap)",
-            attr="© OpenTopoMap / © OpenStreetMap contributors",
-            overlay=False, control=True
-        ).add_to(mp)
-    elif basemap == "Satélite (Esri)":
-        folium.TileLayer(
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            name="Satélite (Esri)", attr="Tiles © Esri", overlay=False, control=True
-        ).add_to(mp)
-    else:
-        folium.TileLayer("OpenStreetMap", name="Calles (OSM)", overlay=False, control=True).add_to(mp)
-
-    def style_pop(feat):
-        v = feat["properties"].get(pop_col_in_table)
+with tab_tables:
+    st.subheader("Tabla de secciones (filtradas)")
+    show_cols = [c for c in [col_ent, col_mun, col_dl, col_df, col_sec, col_manz, col_p18, col_vot] if c and c in secc_f.columns]
+    df_secc = secc_f[show_cols].copy() if show_cols else secc_f.drop(columns=["geometry"], errors="ignore").copy()
+    # normalizar tipos
+    for c in df_secc.columns:
+        if c == "geometry":
+            continue
+        if df_secc[c].dtype == "object":
+            continue
+        # dejar como int si aplica
         try:
-            v = float(v) if v is not None else None
+            df_secc[c] = pd.to_numeric(df_secc[c], errors="ignore")
         except Exception:
-            v = None
-        if v is None or (v != v):
-            return {"weight": 1, "fillOpacity": 0.02}
-        if v <= 1000:
-            return {"weight": 1.4, "fillOpacity": 0.06}
-        if v <= 3000:
-            return {"weight": 1.4, "fillOpacity": 0.09}
-        return {"weight": 1.4, "fillOpacity": 0.12}
+            pass
 
-    folium.GeoJson(
-        merged.to_json(),
-        name="Población por Sección",
-        style_function=style_pop,
-        tooltip=folium.GeoJsonTooltip(fields=[secc_id_col, pop_col_in_table], aliases=["Sección:", "Población:"], sticky=False),
-    ).add_to(mp)
+    st.dataframe(df_secc.drop(columns=["geometry"], errors="ignore"), use_container_width=True, height=420)
 
-    folium.LayerControl(collapsed=False).add_to(mp)
-    bds = merged.total_bounds
-    mp.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
+    st.subheader("Tabla de manzanas (recorte)")
+    mza_cols = [c for c in [mza_sec, mza_p18] if c and c in mza_bbox.columns]
+    df_mza = mza_bbox.drop(columns=["geometry"], errors="ignore").copy()
+    if mza_cols:
+        # traer primero las claves si existen
+        front = [c for c in ["CVE_ENT","CVE_MUN","CVE_LOC","CVE_AGEB","CVE_MZA","TIPOMZA"] if c in df_mza.columns]
+        cols = front + [c for c in mza_cols if c not in front]
+        cols = cols + [c for c in df_mza.columns if c not in cols]
+        df_mza = df_mza[cols]
+    st.dataframe(df_mza, use_container_width=True, height=420)
 
-    st_folium(mp, use_container_width=True, height=650)
+# -------------------------
+# EXPORT
+# -------------------------
+with tab_export:
+    st.subheader("Exportación")
+
+    # Resumen
+    resumen = {
+        "SECCIONES": len(secc_f),
+        "MANZANAS_BBOX": len(mza_bbox),
+    }
+    if col_manz:
+        resumen["MANZANAS_SUM_SECCIONES"] = int(secc_f[col_manz].fillna(0).sum())
+    if col_p18:
+        resumen["POB18MAS_TOTAL"] = int(pd.to_numeric(secc_f[col_p18], errors="coerce").fillna(0).sum())
+    if col_vot:
+        resumen["VOTANTES_TOTAL"] = int(pd.to_numeric(secc_f[col_vot], errors="coerce").fillna(0).sum())
+
+    df_res = pd.DataFrame([resumen])
+
+    st.download_button(
+        "⬇️ Descargar Excel (resumen + secciones + manzanas)",
+        data=to_excel_bytes({"RESUMEN": df_res, "SECCIONES": df_secc.drop(columns=["geometry"], errors="ignore"), "MANZANAS": df_mza}),
+        file_name="export_distrito_seccion_manzanas.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+
+    st.download_button(
+        "⬇️ Descargar CSV (secciones)",
+        data=df_secc.drop(columns=["geometry"], errors="ignore").to_csv(index=False).encode("utf-8"),
+        file_name="secciones_filtradas.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    st.download_button(
+        "⬇️ Descargar CSV (manzanas recorte)",
+        data=df_mza.to_csv(index=False).encode("utf-8"),
+        file_name="manzanas_recorte.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+st.success("✅ Listo. Usa los filtros arriba para ver distrito/secciones y exportar.")
