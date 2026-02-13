@@ -2,14 +2,16 @@
 # app_mapa_1zip.py
 # 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
-# ✅ NUEVO: Filtro por VARIAS SECCIONES (multiselect) + botones “Seleccionar todas / Limpiar”
+# ✅ Filtro por VARIAS SECCIONES (multiselect)
+# ✅ Exportar a KMZ (KML comprimido) con secciones y (opcional) manzanas
+# ✅ “Imprimir pantalla”: descarga del HTML del mapa (ábrelo en navegador y Ctrl+P / Imprimir)
 #
 # - Sube SOLO 1 ZIP que contenga ambos SHP:
 #     * Secciones (INE): ...SECCION*.shp o ...SECCIONES*.shp
 #     * Manzanas (INEGI): ...MANZANAS*.shp o ...25m.shp
 # - Filtros: Distrito local/federal, Municipio y (multi) Sección
 # - Mapa base: relieve/topo/calles/satélite
-# - Tablas + export CSV/Excel
+# - Tablas + export CSV/Excel/KMZ/HTML del mapa
 #
 # Nota: para que funcione sin broncas, el ZIP debe traer .shp + .dbf + .shx + .prj (y opcional .cpg)
 
@@ -21,7 +23,7 @@ import re
 import zipfile
 import tempfile
 import hashlib
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Iterable
 
 import pandas as pd
 import streamlit as st
@@ -180,6 +182,140 @@ def to_excel_bytes(sheets: dict) -> bytes:
 
 
 # -------------------------
+# KML / KMZ export helpers (sin dependencias)
+# -------------------------
+def xml_escape(s: str) -> str:
+    s = "" if s is None else str(s)
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&apos;"))
+
+
+def iter_polygons(geom) -> Iterable:
+    """Devuelve polígonos (Polygon) a partir de Polygon/MultiPolygon."""
+    if geom is None:
+        return []
+    gt = geom.geom_type
+    if gt == "Polygon":
+        return [geom]
+    if gt == "MultiPolygon":
+        return list(geom.geoms)
+    # si viniera GeometryCollection
+    if gt == "GeometryCollection":
+        out = []
+        for g in geom.geoms:
+            out.extend(iter_polygons(g))
+        return out
+    return []
+
+
+def ring_to_kml_coords(ring) -> str:
+    # ring: LinearRing
+    coords = list(ring.coords)
+    # KML wants lon,lat,alt
+    return " ".join([f"{x:.8f},{y:.8f},0" for x, y in coords])
+
+
+def geom_to_kml(geom) -> str:
+    """Convierte (Multi)Polygon a KML Polygon(s)."""
+    polys = iter_polygons(geom)
+    if not polys:
+        return ""
+    if len(polys) == 1:
+        return polygon_to_kml(polys[0])
+    # MultiGeometry
+    parts = "\n".join([polygon_to_kml(p) for p in polys])
+    return f"<MultiGeometry>\n{parts}\n</MultiGeometry>"
+
+
+def polygon_to_kml(poly) -> str:
+    outer = ring_to_kml_coords(poly.exterior)
+    inners = ""
+    for interior in poly.interiors:
+        inners += f"""
+        <innerBoundaryIs>
+          <LinearRing>
+            <coordinates>{ring_to_kml_coords(interior)}</coordinates>
+          </LinearRing>
+        </innerBoundaryIs>"""
+    return f"""
+    <Polygon>
+      <outerBoundaryIs>
+        <LinearRing>
+          <coordinates>{outer}</coordinates>
+        </LinearRing>
+      </outerBoundaryIs>
+      {inners}
+    </Polygon>"""
+
+
+def gdf_to_kml_folder(gdf: gpd.GeoDataFrame, folder_name: str, name_col: Optional[str], max_features: int) -> str:
+    gdf2 = gdf.copy()
+    if len(gdf2) > max_features:
+        gdf2 = gdf2.sample(max_features, random_state=7).copy()
+
+    placemarks = []
+    cols = [c for c in gdf2.columns if c != "geometry"]
+    for _, row in gdf2.iterrows():
+        geom = row.geometry
+        kml_geom = geom_to_kml(geom)
+        if not kml_geom:
+            continue
+
+        nm = ""
+        if name_col and name_col in gdf2.columns:
+            nm = str(row.get(name_col))
+        else:
+            # intenta con SECCION si existe
+            nm = str(row.get("SECCION") or row.get("SECC") or "")
+
+        # ExtendedData
+        data_items = []
+        for c in cols:
+            v = row.get(c)
+            if pd.isna(v):
+                continue
+            data_items.append(f'<Data name="{xml_escape(c)}"><value>{xml_escape(v)}</value></Data>')
+        ext = f"<ExtendedData>{''.join(data_items)}</ExtendedData>" if data_items else ""
+
+        placemarks.append(f"""
+        <Placemark>
+          <name>{xml_escape(nm)}</name>
+          {ext}
+          {kml_geom}
+        </Placemark>
+        """)
+    return f"<Folder><name>{xml_escape(folder_name)}</name>{''.join(placemarks)}</Folder>"
+
+
+def build_kml_document(secc_gdf: gpd.GeoDataFrame, mza_gdf: Optional[gpd.GeoDataFrame],
+                       name_col_secc: Optional[str], name_col_mza: Optional[str],
+                       max_manzanas: int) -> str:
+    folders = []
+    folders.append(gdf_to_kml_folder(secc_gdf, "SECCIONES", name_col_secc, max_features=len(secc_gdf)))
+    if mza_gdf is not None and len(mza_gdf) > 0:
+        folders.append(gdf_to_kml_folder(mza_gdf, "MANZANAS", name_col_mza, max_features=max_manzanas))
+
+    kml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>ICC Export</name>
+  {''.join(folders)}
+</Document>
+</kml>"""
+    return kml
+
+
+def kml_to_kmz_bytes(kml_text: str, doc_name: str = "doc.kml") -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr(doc_name, kml_text.encode("utf-8"))
+    return bio.getvalue()
+
+
+# -------------------------
 # Auto-detect SHPs
 # -------------------------
 def auto_pick_secciones(shps: List[str]) -> Optional[str]:
@@ -298,7 +434,6 @@ with f3:
 with f4:
     if col_sec:
         secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
-        # estado para multiselect
         if "sec_multi" not in st.session_state:
             st.session_state["sec_multi"] = []
 
@@ -315,10 +450,8 @@ with f4:
             key="sec_multi",
         )
 
-        # aplicar filtro si seleccionó algo
         if sec_selected:
-            sec_set = set(int(x) for x in sec_selected)
-            secc_f = secc_f[secc_f[col_sec].astype(int).isin(sec_set)].copy()
+            secc_f = secc_f[secc_f[col_sec].astype(int).isin(set(int(x) for x in sec_selected))].copy()
     else:
         st.write("Sección: (no detectada)")
 
@@ -367,7 +500,7 @@ else:
 # -------------------------
 # Tabs
 # -------------------------
-tab_map, tab_tables, tab_export = st.tabs(["🗺️ Mapa", "📋 Tablas", "⬇️ Exportar"])
+tab_map, tab_tables, tab_export = st.tabs(["🗺️ Mapa", "📋 Tablas", "⬇️ Exportar (Excel/CSV/KMZ/HTML)"])
 
 # -------------------------
 # MAP
@@ -436,7 +569,12 @@ with tab_map:
     bds = secc_f.total_bounds
     m.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
 
+    # guardar HTML del mapa para export/impresión
+    st.session_state["LAST_MAP_HTML"] = m.get_root().render()
+
     st_folium(m, use_container_width=True, height=650)
+
+    st.info("🖨️ Para imprimir: ve a la pestaña **Exportar** y descarga el **HTML del mapa**. Ábrelo en tu navegador y usa **Ctrl+P / Imprimir**.")
 
 # -------------------------
 # TABLES
@@ -445,13 +583,11 @@ with tab_tables:
     st.subheader("Tabla de secciones (filtradas)")
     show_cols = [c for c in [col_ent, col_mun, col_dl, col_df, col_sec, col_manz, col_p18, col_vot] if c and c in secc_f.columns]
     df_secc = secc_f[show_cols].copy() if show_cols else secc_f.drop(columns=["geometry"], errors="ignore").copy()
-
     st.dataframe(df_secc.drop(columns=["geometry"], errors="ignore"), use_container_width=True, height=420)
 
     st.subheader("Tabla de manzanas (recorte)")
     df_mza = mza_bbox.drop(columns=["geometry"], errors="ignore").copy()
 
-    # ordenar columnas típicas al frente
     front = [c for c in ["CVE_ENT", "CVE_MUN", "CVE_LOC", "CVE_AGEB", "CVE_MZA", "TIPOMZA"] if c in df_mza.columns]
     extra = [c for c in [mza_sec, mza_p18] if c and c in df_mza.columns and c not in front]
     rest = [c for c in df_mza.columns if c not in front + extra]
@@ -478,32 +614,78 @@ with tab_export:
 
     df_res = pd.DataFrame([resumen])
 
-    st.download_button(
-        "⬇️ Descargar Excel (resumen + secciones + manzanas)",
-        data=to_excel_bytes({
-            "RESUMEN": df_res,
-            "SECCIONES": df_secc.drop(columns=["geometry"], errors="ignore"),
-            "MANZANAS": df_mza
-        }),
-        file_name="export_distrito_secciones_manzanas.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )
+    cA, cB = st.columns(2)
+    with cA:
+        st.download_button(
+            "⬇️ Excel (resumen + secciones + manzanas)",
+            data=to_excel_bytes({
+                "RESUMEN": df_res,
+                "SECCIONES": df_secc.drop(columns=["geometry"], errors="ignore"),
+                "MANZANAS": df_mza
+            }),
+            file_name="export_distrito_secciones_manzanas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    with cB:
+        st.download_button(
+            "⬇️ CSV (secciones)",
+            data=df_secc.drop(columns=["geometry"], errors="ignore").to_csv(index=False).encode("utf-8"),
+            file_name="secciones_filtradas.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
     st.download_button(
-        "⬇️ Descargar CSV (secciones)",
-        data=df_secc.drop(columns=["geometry"], errors="ignore").to_csv(index=False).encode("utf-8"),
-        file_name="secciones_filtradas.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    st.download_button(
-        "⬇️ Descargar CSV (manzanas recorte)",
+        "⬇️ CSV (manzanas recorte)",
         data=df_mza.to_csv(index=False).encode("utf-8"),
         file_name="manzanas_recorte.csv",
         mime="text/csv",
         use_container_width=True
     )
 
-st.success("✅ Listo. Ahora puedes seleccionar VARIAS secciones (multi) y exportar.")
+    st.divider()
+    st.subheader("🗺️ Exportar KMZ (Google Earth)")
+
+    include_manz = st.checkbox("Incluir manzanas en el KMZ (puede pesar)", value=False)
+    max_mz = st.slider("Límite máximo de manzanas en KMZ", min_value=500, max_value=20000, value=6000, step=500, help="Si hay muchas manzanas, limita para que el KMZ no se haga enorme.")
+    name_col_secc = col_sec if col_sec else None
+    name_col_mza = mza_sec if mza_sec else None
+
+    # construir kmz bytes (solo cuando piden descargar)
+    if st.button("Preparar KMZ", use_container_width=True):
+        with st.spinner("Generando KMZ..."):
+            # secc_f y mza_bbox ya están en EPSG:4326
+            mza_for_kmz = mza_bbox if include_manz else None
+            kml = build_kml_document(secc_f, mza_for_kmz, name_col_secc, name_col_mza, max_manzanas=max_mz)
+            kmz_bytes = kml_to_kmz_bytes(kml, "doc.kml")
+            st.session_state["LAST_KMZ"] = kmz_bytes
+        st.success("KMZ listo ✅")
+
+    kmz_bytes = st.session_state.get("LAST_KMZ")
+    if kmz_bytes:
+        st.download_button(
+            "⬇️ Descargar KMZ",
+            data=kmz_bytes,
+            file_name="export_secciones_manzanas.kmz",
+            mime="application/vnd.google-earth.kmz",
+            use_container_width=True
+        )
+
+    st.divider()
+    st.subheader("🖨️ Imprimir (pantalla del mapa)")
+
+    map_html = st.session_state.get("LAST_MAP_HTML")
+    if not map_html:
+        st.info("Primero entra a la pestaña **Mapa** para que se genere el HTML.")
+    else:
+        st.download_button(
+            "⬇️ Descargar HTML del mapa (para imprimir)",
+            data=map_html.encode("utf-8"),
+            file_name="mapa_filtrado.html",
+            mime="text/html",
+            use_container_width=True
+        )
+        st.caption("Abre el HTML en tu navegador y usa **Ctrl+P / Imprimir** (o “Guardar como PDF”).")
+
+st.success("✅ Listo. Ya tienes multi-secciones + KMZ + HTML imprimible.")
