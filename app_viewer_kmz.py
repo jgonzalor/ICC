@@ -2,10 +2,12 @@
 # app_mapa_1zip.py
 # 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
+# ✅ NUEVO: Filtro por VARIAS SECCIONES (multiselect) + botones “Seleccionar todas / Limpiar”
+#
 # - Sube SOLO 1 ZIP que contenga ambos SHP:
 #     * Secciones (INE): ...SECCION*.shp o ...SECCIONES*.shp
 #     * Manzanas (INEGI): ...MANZANAS*.shp o ...25m.shp
-# - Filtros: Distrito local/federal, Municipio y Sección
+# - Filtros: Distrito local/federal, Municipio y (multi) Sección
 # - Mapa base: relieve/topo/calles/satélite
 # - Tablas + export CSV/Excel
 #
@@ -34,7 +36,7 @@ from streamlit_folium import st_folium
 # -------------------------
 st.set_page_config(page_title="ICC — 1 ZIP Mapas", page_icon="🗺️", layout="wide")
 st.title("🗺️ ICC — Mapas con 1 ZIP (Secciones + Manzanas)")
-st.caption("Sube un ZIP que ya contenga Secciones (INE) y Manzanas (INEGI). Filtra por distrito y sección.")
+st.caption("Sube un ZIP que ya contenga Secciones (INE) y Manzanas (INEGI). Filtra por distrito y sección (multi).")
 
 
 # -------------------------
@@ -182,7 +184,6 @@ def to_excel_bytes(sheets: dict) -> bytes:
 # -------------------------
 def auto_pick_secciones(shps: List[str]) -> Optional[str]:
     low = [s.lower() for s in shps]
-    # prefer explicit "secciones_distrito"
     for i, s in enumerate(low):
         if "secciones" in s and s.endswith(".shp"):
             return shps[i]
@@ -225,7 +226,6 @@ if not shps:
     st.error("No encontré ningún .shp dentro del ZIP.")
     st.stop()
 
-# selección automática + manual
 secc_guess = auto_pick_secciones(shps)
 mza_guess = auto_pick_manzanas(shps)
 
@@ -246,7 +246,6 @@ with st.spinner("Leyendo capas..."):
 # -------------------------
 # Columnas esperadas
 # -------------------------
-# Para secciones INE: ENTIDAD, MUNICIPIO, DISTRITO_L, DISTRITO_F, SECCION, etc.
 col_ent = pick_col(list(secc.columns), ["ENTIDAD", "CVE_ENT", "ENT"])
 col_mun = pick_col(list(secc.columns), ["MUNICIPIO", "CVE_MUN", "MUN"])
 col_dl  = pick_col(list(secc.columns), ["DISTRITO_L", "DISTRITO", "DTO_L", "DIST_L"])
@@ -256,7 +255,6 @@ col_manz = pick_col(list(secc.columns), ["MANZANAS"])
 col_vot = pick_col(list(secc.columns), ["VOTANTES", "VOT_EST"])
 col_p18 = pick_col(list(secc.columns), ["POB18MAS", "POB_18_MAS", "P18MAS"])
 
-# Manzanas: SECCION y POB18MAS opcionales
 mza_sec = pick_col(list(mza.columns), ["SECCION"])
 mza_p18 = pick_col(list(mza.columns), ["POB18MAS", "POB_18_MAS", "P18MAS"])
 
@@ -299,11 +297,28 @@ with f3:
 
 with f4:
     if col_sec:
-        # No saturar: si hay muchas, permitir buscar
         secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
-        sec_sel = st.selectbox("Sección", ["(todas)"] + secs, index=0)
-        if sec_sel != "(todas)":
-            secc_f = secc_f[secc_f[col_sec].astype(int) == int(sec_sel)].copy()
+        # estado para multiselect
+        if "sec_multi" not in st.session_state:
+            st.session_state["sec_multi"] = []
+
+        b1, b2 = st.columns(2)
+        if b1.button("Seleccionar todas", use_container_width=True):
+            st.session_state["sec_multi"] = secs
+        if b2.button("Limpiar", use_container_width=True):
+            st.session_state["sec_multi"] = []
+
+        sec_selected = st.multiselect(
+            "Secciones (multi)",
+            options=secs,
+            default=st.session_state.get("sec_multi", []),
+            key="sec_multi",
+        )
+
+        # aplicar filtro si seleccionó algo
+        if sec_selected:
+            sec_set = set(int(x) for x in sec_selected)
+            secc_f = secc_f[secc_f[col_sec].astype(int).isin(sec_set)].copy()
     else:
         st.write("Sección: (no detectada)")
 
@@ -315,10 +330,12 @@ if secc_f.empty:
 minx, miny, maxx, maxy = secc_f.total_bounds
 mza_bbox = mza.cx[minx:maxx, miny:maxy].copy()
 
-# si manzanas tiene SECCION, filtrar más fino si hay selección de sección
-if mza_sec and col_sec and ("sec_sel" in locals()) and sec_sel != "(todas)":
+# si manzanas tiene SECCION, filtrar por las seleccionadas (más exacto que bbox)
+if col_sec and mza_sec and col_sec in secc_f.columns:
     try:
-        mza_bbox = mza_bbox[mza_bbox[mza_sec].astype(int) == int(sec_sel)].copy()
+        selected_secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
+        if selected_secs:
+            mza_bbox = mza_bbox[mza_bbox[mza_sec].astype(int).isin(set(selected_secs))].copy()
     except Exception:
         pass
 
@@ -330,7 +347,7 @@ st.subheader("📌 Información general del recorte")
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Secciones", f"{len(secc_f):,}")
-k2.metric("Manzanas (bbox)", f"{len(mza_bbox):,}")
+k2.metric("Manzanas (recorte)", f"{len(mza_bbox):,}")
 
 if col_manz:
     k3.metric("Manzanas (sum en secciones)", f"{int(secc_f[col_manz].fillna(0).sum()):,}")
@@ -385,7 +402,15 @@ with tab_map:
     # Tooltip fields
     fields = []
     aliases = []
-    for c, a in [(col_sec, "Sección:"), (col_dl, "DL:"), (col_df, "DF:"), (col_mun, "Mpio:"), (col_manz, "Manzanas:"), (col_vot, "Votantes:"), (col_p18, "POB18+:")]:
+    for c, a in [
+        (col_sec, "Sección:"),
+        (col_dl, "DL:"),
+        (col_df, "DF:"),
+        (col_mun, "Mpio:"),
+        (col_manz, "Manzanas:"),
+        (col_vot, "Votantes:"),
+        (col_p18, "POB18+:"),
+    ]:
         if c and c in secc_f.columns:
             fields.append(c)
             aliases.append(a)
@@ -408,7 +433,6 @@ with tab_map:
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
-
     bds = secc_f.total_bounds
     m.fit_bounds([[bds[1], bds[0]], [bds[3], bds[2]]])
 
@@ -421,29 +445,18 @@ with tab_tables:
     st.subheader("Tabla de secciones (filtradas)")
     show_cols = [c for c in [col_ent, col_mun, col_dl, col_df, col_sec, col_manz, col_p18, col_vot] if c and c in secc_f.columns]
     df_secc = secc_f[show_cols].copy() if show_cols else secc_f.drop(columns=["geometry"], errors="ignore").copy()
-    # normalizar tipos
-    for c in df_secc.columns:
-        if c == "geometry":
-            continue
-        if df_secc[c].dtype == "object":
-            continue
-        # dejar como int si aplica
-        try:
-            df_secc[c] = pd.to_numeric(df_secc[c], errors="ignore")
-        except Exception:
-            pass
 
     st.dataframe(df_secc.drop(columns=["geometry"], errors="ignore"), use_container_width=True, height=420)
 
     st.subheader("Tabla de manzanas (recorte)")
-    mza_cols = [c for c in [mza_sec, mza_p18] if c and c in mza_bbox.columns]
     df_mza = mza_bbox.drop(columns=["geometry"], errors="ignore").copy()
-    if mza_cols:
-        # traer primero las claves si existen
-        front = [c for c in ["CVE_ENT","CVE_MUN","CVE_LOC","CVE_AGEB","CVE_MZA","TIPOMZA"] if c in df_mza.columns]
-        cols = front + [c for c in mza_cols if c not in front]
-        cols = cols + [c for c in df_mza.columns if c not in cols]
-        df_mza = df_mza[cols]
+
+    # ordenar columnas típicas al frente
+    front = [c for c in ["CVE_ENT", "CVE_MUN", "CVE_LOC", "CVE_AGEB", "CVE_MZA", "TIPOMZA"] if c in df_mza.columns]
+    extra = [c for c in [mza_sec, mza_p18] if c and c in df_mza.columns and c not in front]
+    rest = [c for c in df_mza.columns if c not in front + extra]
+    df_mza = df_mza[front + extra + rest]
+
     st.dataframe(df_mza, use_container_width=True, height=420)
 
 # -------------------------
@@ -452,10 +465,9 @@ with tab_tables:
 with tab_export:
     st.subheader("Exportación")
 
-    # Resumen
     resumen = {
         "SECCIONES": len(secc_f),
-        "MANZANAS_BBOX": len(mza_bbox),
+        "MANZANAS_RECORTE": len(mza_bbox),
     }
     if col_manz:
         resumen["MANZANAS_SUM_SECCIONES"] = int(secc_f[col_manz].fillna(0).sum())
@@ -468,8 +480,12 @@ with tab_export:
 
     st.download_button(
         "⬇️ Descargar Excel (resumen + secciones + manzanas)",
-        data=to_excel_bytes({"RESUMEN": df_res, "SECCIONES": df_secc.drop(columns=["geometry"], errors="ignore"), "MANZANAS": df_mza}),
-        file_name="export_distrito_seccion_manzanas.xlsx",
+        data=to_excel_bytes({
+            "RESUMEN": df_res,
+            "SECCIONES": df_secc.drop(columns=["geometry"], errors="ignore"),
+            "MANZANAS": df_mza
+        }),
+        file_name="export_distrito_secciones_manzanas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -490,4 +506,4 @@ with tab_export:
         use_container_width=True
     )
 
-st.success("✅ Listo. Usa los filtros arriba para ver distrito/secciones y exportar.")
+st.success("✅ Listo. Ahora puedes seleccionar VARIAS secciones (multi) y exportar.")
