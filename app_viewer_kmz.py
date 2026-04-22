@@ -182,6 +182,54 @@ def safe_int_values(series: pd.Series) -> List[int]:
     return sorted(vals.astype(int).unique().tolist())
 
 
+def parse_section_tokens(raw_text: str) -> List[int]:
+    """Acepta formatos como: 45,57-60,78"""
+    txt = (raw_text or "").strip()
+    if not txt:
+        return []
+
+    out = []
+    seen = set()
+    for token in re.split(r"[;,\s]+", txt):
+        token = token.strip()
+        if not token:
+            continue
+
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2))
+            lo, hi = sorted((a, b))
+            for v in range(lo, hi + 1):
+                if v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            continue
+
+        if re.fullmatch(r"\d+", token):
+            v = int(token)
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+
+    return out
+
+
+def normalize_selected_sections(valid_secs: List[int], current_selected: Optional[List[int]]) -> List[int]:
+    valid_set = set(int(x) for x in valid_secs)
+    selected = []
+    seen = set()
+    for v in (current_selected or []):
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv in valid_set and iv not in seen:
+            seen.add(iv)
+            selected.append(iv)
+    return sorted(selected)
+
+
 # -------------------------
 # Editor helpers
 # -------------------------
@@ -854,21 +902,86 @@ with f3:
 with f4:
     if col_sec:
         secs = safe_int_values(secc_f[col_sec])
-        if "sec_multi" not in st.session_state:
-            st.session_state["sec_multi"] = []
+        st.session_state["sec_multi"] = normalize_selected_sections(secs, st.session_state.get("sec_multi", []))
+
+        mode = st.radio(
+            "Modo de selección",
+            options=["Checklist rápida", "Lista desplegable", "Captura por rango"],
+            horizontal=True,
+            key="sec_selector_mode",
+        )
 
         b1, b2 = st.columns(2)
         if b1.button("Seleccionar todas", use_container_width=True):
-            st.session_state["sec_multi"] = secs
+            st.session_state["sec_multi"] = secs.copy()
         if b2.button("Limpiar", use_container_width=True):
             st.session_state["sec_multi"] = []
+            st.session_state["sec_quick_input"] = ""
+            for s in secs:
+                st.session_state[f"sec_chk_{s}"] = False
 
-        sec_selected = st.multiselect(
-            "Secciones (multi)",
-            options=secs,
-            default=st.session_state.get("sec_multi", []),
-            key="sec_multi",
-        )
+        if mode == "Lista desplegable":
+            sec_selected = st.multiselect(
+                "Secciones (multi)",
+                options=secs,
+                default=st.session_state.get("sec_multi", []),
+                key="sec_multi_widget",
+                placeholder="Elige una o varias secciones",
+            )
+            st.session_state["sec_multi"] = normalize_selected_sections(secs, sec_selected)
+
+        elif mode == "Captura por rango":
+            st.caption("Ejemplo: 45,57-60,78")
+            quick_input = st.text_input(
+                "Secciones",
+                value=st.session_state.get("sec_quick_input", ""),
+                key="sec_quick_input",
+                placeholder="45,57-60,78",
+            )
+            c_add, c_replace = st.columns(2)
+            parsed = [v for v in parse_section_tokens(quick_input) if v in set(secs)]
+            if c_add.button("Agregar captura", use_container_width=True):
+                merged = sorted(set(st.session_state.get("sec_multi", [])) | set(parsed))
+                st.session_state["sec_multi"] = merged
+            if c_replace.button("Reemplazar selección", use_container_width=True):
+                st.session_state["sec_multi"] = parsed
+
+            if quick_input.strip() and not parsed:
+                st.info("No encontré secciones válidas con esa captura dentro del filtro actual.")
+
+        else:
+            search_txt = st.text_input(
+                "Buscar sección",
+                value=st.session_state.get("sec_search", ""),
+                key="sec_search",
+                placeholder="Escribe parte del número...",
+            ).strip()
+
+            visible_secs = [s for s in secs if search_txt in str(s)] if search_txt else secs
+            v1, v2 = st.columns(2)
+            if v1.button("Marcar visibles", use_container_width=True):
+                st.session_state["sec_multi"] = sorted(set(st.session_state.get("sec_multi", [])) | set(visible_secs))
+            if v2.button("Quitar visibles", use_container_width=True):
+                st.session_state["sec_multi"] = [s for s in st.session_state.get("sec_multi", []) if s not in set(visible_secs)]
+
+            st.caption(f"Visibles: {len(visible_secs):,} | Seleccionadas: {len(st.session_state.get('sec_multi', [])):,}")
+            with st.container(border=True):
+                cols_chk = st.columns(4)
+                selected_now = []
+                selected_seed = set(st.session_state.get("sec_multi", []))
+                for idx, s in enumerate(visible_secs):
+                    key = f"sec_chk_{s}"
+                    if key not in st.session_state:
+                        st.session_state[key] = s in selected_seed
+                    cols_chk[idx % 4].checkbox(str(s), key=key)
+
+                for s in secs:
+                    if st.session_state.get(f"sec_chk_{s}", False):
+                        selected_now.append(s)
+
+                st.session_state["sec_multi"] = selected_now
+
+        sec_selected = normalize_selected_sections(secs, st.session_state.get("sec_multi", []))
 
         if sec_selected:
             secc_f = secc_f[pd.to_numeric(secc_f[col_sec], errors="coerce").fillna(-999999).astype(int).isin(set(int(x) for x in sec_selected))].copy()
