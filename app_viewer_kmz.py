@@ -1,13 +1,11 @@
-
-# app_mapa_1zip.py
+# app_mapa_1zip_v2_kmz_editable.py
 # 🗺️ ICC — Mapa con 1 ZIP (Secciones INE + Manzanas INEGI)
 #
-# ✅ Filtro por VARIAS SECCIONES (multiselect)
-# ✅ Secciones con color distinto + etiquetas visibles en el mapa (número de sección)
-# ✅ Exportar a KMZ con:
-#    - Polígonos coloreados por sección
-#    - Etiquetas (labels) por sección (opcional) como puntos sin ícono (más confiable en Google Earth)
-# ✅ “Imprimir pantalla”: descarga del HTML del mapa (ábrelo en navegador y Ctrl+P / Imprimir)
+# Mejoras v2:
+# ✅ KMZ agrupado por Distrito Local exportado
+# ✅ Editor manual para los valores visibles del globo/popup del KMZ
+# ✅ Alias editables para renombrar campos visibles del popup
+# ✅ Popup KMZ personalizado con HTML limpio (en vez de depender solo de ExtendedData)
 
 from __future__ import annotations
 
@@ -17,6 +15,7 @@ import re
 import zipfile
 import tempfile
 import hashlib
+import html
 from typing import List, Tuple, Optional, Iterable, Dict
 
 import pandas as pd
@@ -176,6 +175,64 @@ def to_excel_bytes(sheets: dict) -> bytes:
     return out.getvalue()
 
 
+def safe_int_values(series: pd.Series) -> List[int]:
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if vals.empty:
+        return []
+    return sorted(vals.astype(int).unique().tolist())
+
+
+# -------------------------
+# Editor helpers
+# -------------------------
+def df_fingerprint(df: pd.DataFrame) -> str:
+    payload = f"{list(df.columns)}|{len(df)}|{df.head(50).to_json(orient='split', date_format='iso', default_handler=str)}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def ensure_editor_df(state_key: str, fp_key: str, source_df: pd.DataFrame) -> pd.DataFrame:
+    fp = df_fingerprint(source_df)
+    if fp_key not in st.session_state or st.session_state.get(fp_key) != fp:
+        st.session_state[state_key] = source_df.copy()
+        st.session_state[fp_key] = fp
+    return st.session_state[state_key].copy()
+
+
+def update_editor_df(state_key: str, edited_df: pd.DataFrame) -> None:
+    st.session_state[state_key] = edited_df.copy()
+
+
+def normalize_alias_df(selected_cols: List[str], alias_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    base = pd.DataFrame({"CAMPO": selected_cols, "ETIQUETA": selected_cols})
+    if alias_df is None or alias_df.empty:
+        return base
+
+    alias_df2 = alias_df.copy()
+    if "CAMPO" not in alias_df2.columns or "ETIQUETA" not in alias_df2.columns:
+        return base
+
+    alias_map_prev = {}
+    for _, row in alias_df2.iterrows():
+        campo = str(row.get("CAMPO", "")).strip()
+        if campo:
+            alias_map_prev[campo] = str(row.get("ETIQUETA", campo)).strip() or campo
+
+    base["ETIQUETA"] = base["CAMPO"].map(lambda c: alias_map_prev.get(c, c))
+    return base
+
+
+def alias_df_to_map(alias_df: pd.DataFrame) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if alias_df is None or alias_df.empty:
+        return out
+    for _, row in alias_df.iterrows():
+        campo = str(row.get("CAMPO", "")).strip()
+        etiqueta = str(row.get("ETIQUETA", campo)).strip() or campo
+        if campo:
+            out[campo] = etiqueta
+    return out
+
+
 # -------------------------
 # Color helpers for sections
 # -------------------------
@@ -204,7 +261,7 @@ def _hsl_to_rgb(h: float, s: float, l: float) -> Tuple[int, int, int]:
 def color_for_section(section_value) -> str:
     """Color determinístico por sección (hex #RRGGBB)."""
     try:
-        v = int(section_value)
+        v = int(float(section_value))
     except Exception:
         v = abs(hash(str(section_value))) % 100000
     h = (v * 47) % 360
@@ -213,7 +270,7 @@ def color_for_section(section_value) -> str:
 
 
 # -------------------------
-# KML / KMZ export helpers (con estilos + etiquetas)
+# KML / KMZ export helpers (con estilos + etiquetas + popup editable)
 # -------------------------
 def xml_escape(s: str) -> str:
     s = "" if s is None else str(s)
@@ -341,7 +398,6 @@ def build_section_styles(
         """)
 
         # Etiqueta como punto sin ícono (solo texto)
-        # IconStyle scale=0 para ocultar el ícono (queda el label del <name>)
         style_chunks.append(f"""
   <Style id="{xml_escape(lbl_id)}">
     <IconStyle><scale>0</scale></IconStyle>
@@ -352,6 +408,53 @@ def build_section_styles(
     return "\n".join(style_chunks), poly_map, lbl_map
 
 
+def build_popup_description_html(
+    row: pd.Series,
+    popup_cols: List[str],
+    popup_alias_map: Optional[Dict[str, str]] = None,
+    title_value: Optional[str] = None,
+) -> str:
+    popup_alias_map = popup_alias_map or {}
+    title_text = html.escape("" if title_value is None else str(title_value))
+
+    rows_html = []
+    for c in popup_cols:
+        if c not in row.index:
+            continue
+        v = row.get(c)
+        if pd.isna(v):
+            v_txt = ""
+        else:
+            v_txt = str(v)
+        label = popup_alias_map.get(c, c)
+        rows_html.append(
+            "<tr>"
+            f"<td style='border:1px solid #999;padding:4px 6px;background:#f4f4f4;font-weight:600;'>{html.escape(str(label))}</td>"
+            f"<td style='border:1px solid #999;padding:4px 6px;'>{html.escape(v_txt)}</td>"
+            "</tr>"
+        )
+
+    body = "".join(rows_html) if rows_html else "<tr><td style='padding:6px;'>Sin datos</td></tr>"
+    html_block = (
+        "<div style='font-family:Arial,Helvetica,sans-serif;min-width:260px;'>"
+        f"<div style='font-size:16px;font-weight:700;margin-bottom:8px;'>{title_text}</div>"
+        "<table style='border-collapse:collapse;font-size:12px;width:100%;'>"
+        f"{body}"
+        "</table>"
+        "</div>"
+    )
+    return html_block.replace("]]>", "]] ]>")
+
+
+def get_row_title_value(row: pd.Series, preferred_cols: List[str]) -> str:
+    for c in preferred_cols:
+        if c in row.index:
+            v = row.get(c)
+            if v is not None and not pd.isna(v) and str(v).strip() != "":
+                return str(v)
+    return "Elemento"
+
+
 def gdf_to_kml_folder(
     gdf: gpd.GeoDataFrame,
     folder_name: str,
@@ -359,6 +462,9 @@ def gdf_to_kml_folder(
     max_features: int,
     style_by_col: Optional[str] = None,
     style_map: Optional[Dict[str, str]] = None,
+    popup_cols: Optional[List[str]] = None,
+    popup_alias_map: Optional[Dict[str, str]] = None,
+    include_extended_data: bool = False,
 ) -> str:
     gdf2 = gdf.copy()
     if len(gdf2) > max_features:
@@ -366,6 +472,7 @@ def gdf_to_kml_folder(
 
     placemarks = []
     cols = [c for c in gdf2.columns if c != "geometry"]
+    popup_cols = [c for c in (popup_cols or []) if c in gdf2.columns]
 
     for _, row in gdf2.iterrows():
         kml_geom = geom_to_kml(row.geometry)
@@ -386,18 +493,32 @@ def gdf_to_kml_folder(
                 if sid:
                     style_url = f"<styleUrl>#{xml_escape(sid)}</styleUrl>"
 
-        data_items = []
-        for c in cols:
-            v = row.get(c)
-            if pd.isna(v):
-                continue
-            data_items.append(f'<Data name="{xml_escape(c)}"><value>{xml_escape(v)}</value></Data>')
-        ext = f"<ExtendedData>{''.join(data_items)}</ExtendedData>" if data_items else ""
+        description_xml = ""
+        if popup_cols:
+            title_val = get_row_title_value(row, [name_col] if name_col else ["SECCION", "SECC", "ID"])
+            desc_html = build_popup_description_html(
+                row=row,
+                popup_cols=popup_cols,
+                popup_alias_map=popup_alias_map,
+                title_value=title_val,
+            )
+            description_xml = f"<description><![CDATA[{desc_html}]]></description>"
+
+        ext = ""
+        if include_extended_data:
+            data_items = []
+            for c in cols:
+                v = row.get(c)
+                if pd.isna(v):
+                    continue
+                data_items.append(f'<Data name="{xml_escape(c)}"><value>{xml_escape(v)}</value></Data>')
+            ext = f"<ExtendedData>{''.join(data_items)}</ExtendedData>" if data_items else ""
 
         placemarks.append(f"""
         <Placemark>
           <name>{xml_escape(nm)}</name>
           {style_url}
+          {description_xml}
           {ext}
           {kml_geom}
         </Placemark>
@@ -429,44 +550,179 @@ def gdf_to_kml_labels_folder(
     return f"<Folder><name>{xml_escape(folder_name)}</name>{''.join(placemarks)}</Folder>"
 
 
+def kml_folder_wrap(folder_name: str, inner_xml: str) -> str:
+    return f"<Folder><name>{xml_escape(folder_name)}</name>{inner_xml}</Folder>"
+
+
+def folder_name_for_dl(value) -> str:
+    if value is None or pd.isna(value):
+        return "DISTRITO_LOCAL_SIN_VALOR"
+    txt = str(value).strip()
+    return f"DISTRITO_LOCAL_{txt}"
+
+
+def subset_manzanas_for_group(
+    mza_gdf: Optional[gpd.GeoDataFrame],
+    secc_sub: gpd.GeoDataFrame,
+    group_col: Optional[str],
+    group_value,
+    section_col_for_style: Optional[str],
+    mza_section_col: Optional[str],
+) -> Optional[gpd.GeoDataFrame]:
+    if mza_gdf is None or len(mza_gdf) == 0:
+        return None
+
+    try:
+        if group_col and group_col in mza_gdf.columns:
+            return mza_gdf[mza_gdf[group_col].astype(str) == str(group_value)].copy()
+
+        if section_col_for_style and mza_section_col and section_col_for_style in secc_sub.columns and mza_section_col in mza_gdf.columns:
+            sec_values = secc_sub[section_col_for_style].dropna().astype(str).unique().tolist()
+            if sec_values:
+                return mza_gdf[mza_gdf[mza_section_col].astype(str).isin(sec_values)].copy()
+
+        union_geom = secc_sub.geometry.unary_union
+        if union_geom is None:
+            return None
+        mask = mza_gdf.geometry.intersects(union_geom)
+        return mza_gdf[mask].copy()
+    except Exception:
+        return mza_gdf.copy()
+
+
+def build_grouped_kml_folders(
+    secc_gdf: gpd.GeoDataFrame,
+    mza_gdf: Optional[gpd.GeoDataFrame],
+    section_col_for_style: Optional[str],
+    district_local_col: Optional[str],
+    mza_section_col: Optional[str],
+    name_col_secc: Optional[str],
+    name_col_mza: Optional[str],
+    max_manzanas: int,
+    include_labels: bool,
+    poly_style_map: Dict[str, str],
+    lbl_style_map: Dict[str, str],
+    popup_cols_secc: Optional[List[str]],
+    popup_alias_map_secc: Optional[Dict[str, str]],
+) -> str:
+    folders = []
+
+    if district_local_col and district_local_col in secc_gdf.columns:
+        group_values = secc_gdf[district_local_col].dropna().astype(str).unique().tolist()
+        group_values = sorted(group_values, key=lambda x: (len(x), x))
+
+        for dl_val in group_values:
+            secc_sub = secc_gdf[secc_gdf[district_local_col].astype(str) == str(dl_val)].copy()
+            inner_parts = []
+            inner_parts.append(
+                gdf_to_kml_folder(
+                    secc_sub,
+                    "SECCIONES",
+                    name_col_secc,
+                    max_features=len(secc_sub),
+                    style_by_col=section_col_for_style,
+                    style_map=poly_style_map,
+                    popup_cols=popup_cols_secc,
+                    popup_alias_map=popup_alias_map_secc,
+                    include_extended_data=False,
+                )
+            )
+            if include_labels and section_col_for_style and lbl_style_map:
+                inner_parts.append(
+                    gdf_to_kml_labels_folder(secc_sub, "ETIQUETAS_SECCIONES", section_col_for_style, lbl_style_map)
+                )
+
+            mza_sub = subset_manzanas_for_group(
+                mza_gdf=mza_gdf,
+                secc_sub=secc_sub,
+                group_col=district_local_col,
+                group_value=dl_val,
+                section_col_for_style=section_col_for_style,
+                mza_section_col=mza_section_col,
+            )
+            if mza_sub is not None and len(mza_sub) > 0:
+                inner_parts.append(
+                    gdf_to_kml_folder(
+                        mza_sub,
+                        "MANZANAS",
+                        name_col_mza,
+                        max_features=max_manzanas,
+                        include_extended_data=True,
+                    )
+                )
+
+            folders.append(kml_folder_wrap(folder_name_for_dl(dl_val), "".join(inner_parts)))
+    else:
+        folders.append(
+            gdf_to_kml_folder(
+                secc_gdf,
+                "SECCIONES",
+                name_col_secc,
+                max_features=len(secc_gdf),
+                style_by_col=section_col_for_style,
+                style_map=poly_style_map,
+                popup_cols=popup_cols_secc,
+                popup_alias_map=popup_alias_map_secc,
+                include_extended_data=False,
+            )
+        )
+        if include_labels and section_col_for_style and lbl_style_map:
+            folders.append(gdf_to_kml_labels_folder(secc_gdf, "ETIQUETAS_SECCIONES", section_col_for_style, lbl_style_map))
+        if mza_gdf is not None and len(mza_gdf) > 0:
+            folders.append(
+                gdf_to_kml_folder(
+                    mza_gdf,
+                    "MANZANAS",
+                    name_col_mza,
+                    max_features=max_manzanas,
+                    include_extended_data=True,
+                )
+            )
+
+    return "".join(folders)
+
+
 def build_kml_document(
     secc_gdf: gpd.GeoDataFrame,
     mza_gdf: Optional[gpd.GeoDataFrame],
     section_col_for_style: Optional[str],
+    district_local_col: Optional[str],
+    mza_section_col: Optional[str],
     name_col_secc: Optional[str],
     name_col_mza: Optional[str],
     max_manzanas: int,
     alpha_fill: int = 140,
     label_scale: float = 1.2,
     include_labels: bool = True,
+    popup_cols_secc: Optional[List[str]] = None,
+    popup_alias_map_secc: Optional[Dict[str, str]] = None,
 ) -> str:
     styles_xml, poly_style_map, lbl_style_map = build_section_styles(
         secc_gdf, section_col_for_style, alpha_fill=alpha_fill, label_scale=label_scale
     )
 
-    folders = []
-    folders.append(
-        gdf_to_kml_folder(
-            secc_gdf,
-            "SECCIONES",
-            name_col_secc,
-            max_features=len(secc_gdf),
-            style_by_col=section_col_for_style,
-            style_map=poly_style_map,
-        )
+    folders_xml = build_grouped_kml_folders(
+        secc_gdf=secc_gdf,
+        mza_gdf=mza_gdf,
+        section_col_for_style=section_col_for_style,
+        district_local_col=district_local_col,
+        mza_section_col=mza_section_col,
+        name_col_secc=name_col_secc,
+        name_col_mza=name_col_mza,
+        max_manzanas=max_manzanas,
+        include_labels=include_labels,
+        poly_style_map=poly_style_map,
+        lbl_style_map=lbl_style_map,
+        popup_cols_secc=popup_cols_secc,
+        popup_alias_map_secc=popup_alias_map_secc,
     )
-    if include_labels and section_col_for_style and lbl_style_map:
-        folders.append(gdf_to_kml_labels_folder(secc_gdf, "ETIQUETAS_SECCIONES", section_col_for_style, lbl_style_map))
-
-    if mza_gdf is not None and len(mza_gdf) > 0:
-        folders.append(gdf_to_kml_folder(mza_gdf, "MANZANAS", name_col_mza, max_features=max_manzanas))
 
     kml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
   <name>ICC Export</name>
   {styles_xml}
-  {''.join(folders)}
+  {folders_xml}
 </Document>
 </kml>"""
     return kml
@@ -570,34 +826,34 @@ f1, f2, f3, f4 = st.columns([1, 1, 1, 1])
 
 with f1:
     if col_dl:
-        vals = sorted(secc_f[col_dl].dropna().astype(int).unique().tolist())
+        vals = safe_int_values(secc_f[col_dl])
         dl_sel = st.selectbox("Distrito Local", ["(todos)"] + vals, index=0)
         if dl_sel != "(todos)":
-            secc_f = secc_f[secc_f[col_dl].astype(int) == int(dl_sel)].copy()
+            secc_f = secc_f[pd.to_numeric(secc_f[col_dl], errors="coerce").fillna(-999999).astype(int) == int(dl_sel)].copy()
     else:
         st.write("Distrito Local: (no detectado)")
 
 with f2:
     if col_df:
-        vals = sorted(secc_f[col_df].dropna().astype(int).unique().tolist())
+        vals = safe_int_values(secc_f[col_df])
         df_sel = st.selectbox("Distrito Federal", ["(todos)"] + vals, index=0)
         if df_sel != "(todos)":
-            secc_f = secc_f[secc_f[col_df].astype(int) == int(df_sel)].copy()
+            secc_f = secc_f[pd.to_numeric(secc_f[col_df], errors="coerce").fillna(-999999).astype(int) == int(df_sel)].copy()
     else:
         st.write("Distrito Federal: (no detectado)")
 
 with f3:
     if col_mun:
-        vals = sorted(secc_f[col_mun].dropna().astype(int).unique().tolist())
+        vals = safe_int_values(secc_f[col_mun])
         mun_sel = st.selectbox("Municipio", ["(todos)"] + vals, index=0)
         if mun_sel != "(todos)":
-            secc_f = secc_f[secc_f[col_mun].astype(int) == int(mun_sel)].copy()
+            secc_f = secc_f[pd.to_numeric(secc_f[col_mun], errors="coerce").fillna(-999999).astype(int) == int(mun_sel)].copy()
     else:
         st.write("Municipio: (no detectado)")
 
 with f4:
     if col_sec:
-        secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
+        secs = safe_int_values(secc_f[col_sec])
         if "sec_multi" not in st.session_state:
             st.session_state["sec_multi"] = []
 
@@ -615,7 +871,7 @@ with f4:
         )
 
         if sec_selected:
-            secc_f = secc_f[secc_f[col_sec].astype(int).isin(set(int(x) for x in sec_selected))].copy()
+            secc_f = secc_f[pd.to_numeric(secc_f[col_sec], errors="coerce").fillna(-999999).astype(int).isin(set(int(x) for x in sec_selected))].copy()
     else:
         st.write("Sección: (no detectada)")
 
@@ -630,9 +886,9 @@ mza_bbox = mza.cx[minx:maxx, miny:maxy].copy()
 # si manzanas tiene SECCION, filtrar por las seleccionadas (más exacto que bbox)
 if col_sec and mza_sec and col_sec in secc_f.columns:
     try:
-        selected_secs = sorted(secc_f[col_sec].dropna().astype(int).unique().tolist())
+        selected_secs = sorted(pd.to_numeric(secc_f[col_sec], errors="coerce").dropna().astype(int).unique().tolist())
         if selected_secs:
-            mza_bbox = mza_bbox[mza_bbox[mza_sec].astype(int).isin(set(selected_secs))].copy()
+            mza_bbox = mza_bbox[pd.to_numeric(mza_bbox[mza_sec], errors="coerce").fillna(-999999).astype(int).isin(set(selected_secs))].copy()
     except Exception:
         pass
 
@@ -647,7 +903,7 @@ k1.metric("Secciones", f"{len(secc_f):,}")
 k2.metric("Manzanas (recorte)", f"{len(mza_bbox):,}")
 
 if col_manz:
-    k3.metric("Manzanas (sum en secciones)", f"{int(secc_f[col_manz].fillna(0).sum()):,}")
+    k3.metric("Manzanas (sum en secciones)", f"{int(pd.to_numeric(secc_f[col_manz], errors='coerce').fillna(0).sum()):,}")
 else:
     k3.metric("Manzanas (sum secciones)", "N/D")
 
@@ -799,7 +1055,7 @@ with tab_export:
 
     resumen = {"SECCIONES": len(secc_f), "MANZANAS_RECORTE": len(mza_bbox)}
     if col_manz:
-        resumen["MANZANAS_SUM_SECCIONES"] = int(secc_f[col_manz].fillna(0).sum())
+        resumen["MANZANAS_SUM_SECCIONES"] = int(pd.to_numeric(secc_f[col_manz], errors="coerce").fillna(0).sum())
     if col_p18:
         resumen["POB18MAS_TOTAL"] = int(pd.to_numeric(secc_f[col_p18], errors="coerce").fillna(0).sum())
     if col_vot:
@@ -833,7 +1089,60 @@ with tab_export:
     )
 
     st.divider()
-    st.subheader("🗺️ Exportar KMZ (Google Earth) — con colores + etiquetas de sección")
+    st.subheader("✏️ Edición manual del globo KMZ (Secciones)")
+    st.caption("Aquí sí puedes cambiar manualmente los valores que luego verás en Google Earth al dar clic sobre la sección.")
+
+    secc_for_kmz = secc_f.reset_index(drop=True).copy()
+    secc_for_kmz["__KMZ_ID__"] = range(1, len(secc_for_kmz) + 1)
+
+    secc_edit_source = secc_for_kmz.drop(columns=["geometry"], errors="ignore").copy()
+    ordered_cols = ["__KMZ_ID__"] + [c for c in secc_edit_source.columns if c != "__KMZ_ID__"]
+    secc_edit_source = secc_edit_source[ordered_cols]
+
+    editor_df = ensure_editor_df("KMZ_SECC_EDIT_DF", "KMZ_SECC_EDIT_FP", secc_edit_source)
+    edited_df = st.data_editor(
+        editor_df,
+        key="KMZ_SECC_EDITOR",
+        disabled=["__KMZ_ID__"],
+        use_container_width=True,
+        height=320,
+        num_rows="fixed",
+    )
+    update_editor_df("KMZ_SECC_EDIT_DF", edited_df)
+
+    all_popup_cols = [c for c in edited_df.columns if c != "__KMZ_ID__"]
+    default_popup_cols = [c for c in [col_sec, col_dl, col_df, col_mun, col_manz, col_vot, col_p18] if c and c in all_popup_cols]
+    if not default_popup_cols:
+        default_popup_cols = all_popup_cols[: min(8, len(all_popup_cols))]
+
+    selected_popup_cols = st.multiselect(
+        "Campos que se verán en el globo KMZ",
+        options=all_popup_cols,
+        default=default_popup_cols,
+        key="KMZ_POPUP_COLS",
+        help="Estos son los campos que saldrán en el popup del KMZ. Los valores los puedes editar en la tabla de arriba.",
+    )
+
+    alias_state_key = "KMZ_ALIAS_DF"
+    alias_fp_key = "KMZ_ALIAS_FP"
+    alias_seed = normalize_alias_df(selected_popup_cols, st.session_state.get(alias_state_key))
+    alias_df = ensure_editor_df(alias_state_key, alias_fp_key, alias_seed)
+    alias_df = normalize_alias_df(selected_popup_cols, alias_df)
+
+    st.caption("Renombra aquí cómo quieres que aparezca cada campo en el popup de Google Earth.")
+    alias_df_edited = st.data_editor(
+        alias_df,
+        key="KMZ_ALIAS_EDITOR",
+        disabled=["CAMPO"],
+        use_container_width=True,
+        height=min(80 + max(len(alias_df), 1) * 35, 360),
+        num_rows="fixed",
+    )
+    update_editor_df(alias_state_key, normalize_alias_df(selected_popup_cols, alias_df_edited))
+    popup_alias_map = alias_df_to_map(st.session_state.get(alias_state_key, pd.DataFrame()))
+
+    st.divider()
+    st.subheader("🗺️ Exportar KMZ (Google Earth) — agrupado por Distrito Local")
 
     include_manz = st.checkbox("Incluir manzanas en el KMZ (puede pesar)", value=False)
     max_mz = st.slider("Límite máximo de manzanas en KMZ", min_value=500, max_value=20000, value=6000, step=500)
@@ -842,30 +1151,45 @@ with tab_export:
     include_kmz_labels = st.checkbox("Incluir etiquetas (número de sección) en el KMZ", value=True)
     kmz_label_scale = st.slider("Tamaño etiqueta (KMZ)", min_value=0.6, max_value=3.0, value=1.3, step=0.1)
 
+    if col_dl and col_dl in edited_df.columns:
+        dl_export_vals = sorted(edited_df[col_dl].dropna().astype(str).unique().tolist())
+        st.info(f"📦 El KMZ se agrupará dentro de carpetas tipo: {', '.join(folder_name_for_dl(v) for v in dl_export_vals[:3])}{' ...' if len(dl_export_vals) > 3 else ''}")
+    else:
+        st.warning("⚠️ No detecté columna de Distrito Local. El KMZ saldrá sin la carpeta agrupadora por DL.")
+
     if st.button("Preparar KMZ", use_container_width=True):
         with st.spinner("Generando KMZ..."):
+            secc_for_kmz_export = secc_for_kmz.copy()
+            merge_df = edited_df.copy()
+            secc_for_kmz_export = secc_for_kmz_export.drop(columns=[c for c in secc_for_kmz_export.columns if c != "geometry" and c in merge_df.columns and c != "__KMZ_ID__"], errors="ignore")
+            secc_for_kmz_export = secc_for_kmz_export.merge(merge_df, on="__KMZ_ID__", how="left")
+
             mza_for_kmz = mza_bbox if include_manz else None
             kml = build_kml_document(
-                secc_gdf=secc_f,
+                secc_gdf=secc_for_kmz_export,
                 mza_gdf=mza_for_kmz,
                 section_col_for_style=col_sec if col_sec else None,
+                district_local_col=col_dl if col_dl else None,
+                mza_section_col=mza_sec if mza_sec else None,
                 name_col_secc=col_sec if col_sec else None,
                 name_col_mza=mza_sec if mza_sec else None,
                 max_manzanas=max_mz,
                 alpha_fill=int(alpha),
                 label_scale=float(kmz_label_scale),
                 include_labels=bool(include_kmz_labels),
+                popup_cols_secc=selected_popup_cols,
+                popup_alias_map_secc=popup_alias_map,
             )
             kmz_bytes = kml_to_kmz_bytes(kml, "doc.kml")
             st.session_state["LAST_KMZ"] = kmz_bytes
-        st.success("KMZ listo ✅ (coloreado + etiquetas)")
+        st.success("KMZ listo ✅ (agrupado por Distrito Local + popup editable)")
 
     kmz_bytes = st.session_state.get("LAST_KMZ")
     if kmz_bytes:
         st.download_button(
             "⬇️ Descargar KMZ",
             data=kmz_bytes,
-            file_name="export_secciones_manzanas_coloreado_etiquetas.kmz",
+            file_name="export_secciones_manzanas_agrupado_dl_popup_editable.kmz",
             mime="application/vnd.google-earth.kmz",
             use_container_width=True
         )
@@ -886,4 +1210,4 @@ with tab_export:
         )
         st.caption("Abre el HTML en tu navegador y usa **Ctrl+P / Imprimir** (o “Guardar como PDF”).")
 
-st.success("✅ Listo. El KMZ ahora incluye etiquetas por sección (folder ETIQUETAS_SECCIONES).")
+st.success("✅ Listo. El KMZ ahora puede agruparse por Distrito Local y el popup de secciones ya se puede editar manualmente antes de exportar.")
